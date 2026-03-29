@@ -1,18 +1,18 @@
 """
-ghostwriter evaluation harness. Fixed — do not modify.
-Evaluates draft.md against persona rubrics using Claude API.
+ghostwriter evaluation harness.
+Evaluates draft.md against persona rubrics using the configured provider.
 Usage: uv run evaluate.py
 """
 
 import os
 import re
-import sys
 import json
+import subprocess
 import statistics
+import sys
+import tempfile
 import tomllib
 from pathlib import Path
-
-import anthropic
 
 # ---------------------------------------------------------------------------
 # Configuration (loaded from config.toml)
@@ -29,12 +29,15 @@ def load_config() -> dict:
         return tomllib.load(f)
 
 CONFIG = load_config()
+PROVIDER = CONFIG["eval"].get("provider", "anthropic")
 MODEL = CONFIG["eval"]["model"]
+OPENAI_MODEL = CONFIG["eval"].get("openai_model", "gpt-5.4")
 EVAL_RUNS = CONFIG["eval"]["runs"]
 EVAL_TEMPERATURE = CONFIG["eval"]["temperature"]
 MIN_SCORE_THRESHOLD = CONFIG["eval"]["min_improvement"]
 MEAN_SCORE_THRESHOLD = CONFIG["eval"]["mean_improvement"]
 FOCUS_POINTS = CONFIG.get("focus", {})
+READER_PERSONAS = {"hn_reader", "x_reader"}
 
 # ---------------------------------------------------------------------------
 # Parsing
@@ -107,6 +110,17 @@ def load_focus_points() -> dict[str, int]:
     return {k: int(v) for k, v in FOCUS_POINTS.items()}
 
 
+def normalize_provider(provider: str) -> str:
+    provider = provider.strip().lower()
+    if provider == "codex":
+        return "openai"
+    if provider not in {"anthropic", "openai"}:
+        raise ValueError(
+            f"Unsupported eval provider: {provider}. Use 'openai', 'codex', or 'anthropic'."
+        )
+    return provider
+
+
 # ---------------------------------------------------------------------------
 # Evaluation prompt
 # ---------------------------------------------------------------------------
@@ -148,6 +162,7 @@ DRAFT TO EVALUATE:
 ---
 
 INSTRUCTIONS:
+Do not use tools. Evaluate only from the text provided in this prompt.
 For each rubric dimension, you MUST:
 1. Quote or reference a specific passage from the draft that informs your judgment
 2. Explain your reasoning in 1-2 sentences
@@ -189,32 +204,134 @@ def parse_eval_response(response: str, persona: dict) -> dict[str, int] | None:
 # API calls
 # ---------------------------------------------------------------------------
 
-def evaluate_persona(client: anthropic.Anthropic, persona: dict, draft: str) -> list[dict[str, int]]:
+def run_anthropic_prompt(client, prompt: str, temperature: float, model: str) -> str:
+    response = client.messages.create(
+        model=model,
+        max_tokens=2000,
+        temperature=temperature,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return response.content[0].text
+
+
+def check_codex_login_status() -> None:
+    try:
+        result = subprocess.run(
+            ["codex", "login", "status"],
+            capture_output=True,
+            text=True,
+            cwd=BASE_DIR,
+        )
+    except FileNotFoundError as e:
+        raise RuntimeError(
+            "Codex CLI not found. Install it with `npm install -g @openai/codex` "
+            "or switch [eval].provider to 'anthropic'."
+        ) from e
+
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
+        raise RuntimeError(
+            "Codex CLI is not authenticated. Run `codex login` and confirm "
+            f"`codex login status` succeeds. Details: {detail}"
+        )
+
+
+def run_codex_prompt(prompt: str, model: str | None) -> str:
+    try:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_path = Path(tmp_dir) / "codex-response.txt"
+            cmd = [
+                "codex",
+                "exec",
+                "--ephemeral",
+                "-s",
+                "read-only",
+                "-o",
+                str(output_path),
+            ]
+            if model:
+                cmd.extend(["-m", model])
+            cmd.append("-")
+
+            result = subprocess.run(
+                cmd,
+                input=prompt,
+                text=True,
+                capture_output=True,
+                cwd=BASE_DIR,
+            )
+            if result.returncode != 0:
+                detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
+                tail = "\n".join(detail.splitlines()[-10:])
+                raise RuntimeError(f"codex exec failed:\n{tail}")
+            if not output_path.exists():
+                raise RuntimeError("codex exec did not write an output message")
+            return output_path.read_text().strip()
+    except FileNotFoundError as e:
+        raise RuntimeError(
+            "Codex CLI not found. Install it with `npm install -g @openai/codex` "
+            "or switch [eval].provider to 'anthropic'."
+        ) from e
+
+
+def build_openai_prompt_runner():
+    check_codex_login_status()
+    return (
+        lambda prompt, temperature: run_codex_prompt(prompt, OPENAI_MODEL),
+        "openai",
+        OPENAI_MODEL,
+    )
+
+
+def build_prompt_runner(provider: str):
+    if provider == "anthropic":
+        try:
+            import anthropic
+        except ModuleNotFoundError as e:
+            print(
+                "WARNING: Anthropic provider selected but the `anthropic` package is not installed. "
+                "Falling back to Codex/OpenAI evaluator.",
+                file=sys.stderr,
+            )
+            return build_openai_prompt_runner()
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            print(
+                "WARNING: Anthropic provider selected but ANTHROPIC_API_KEY is not set. "
+                "Falling back to Codex/OpenAI evaluator.",
+                file=sys.stderr,
+            )
+            return build_openai_prompt_runner()
+        client = anthropic.Anthropic()
+        return (
+            lambda prompt, temperature: run_anthropic_prompt(client, prompt, temperature, MODEL),
+            "anthropic",
+            MODEL,
+        )
+
+    if provider == "openai":
+        return build_openai_prompt_runner()
+
+    raise RuntimeError(f"Unsupported eval provider: {provider}")
+
+
+def evaluate_persona(prompt_runner, persona: dict, draft: str, provider_label: str) -> list[dict[str, int]]:
     """Run EVAL_RUNS evaluations for a single persona. Returns list of score dicts."""
     prompt = build_eval_prompt(persona, draft)
     results = []
 
     for run in range(EVAL_RUNS):
         try:
-            response = client.messages.create(
-                model=MODEL,
-                max_tokens=2000,
-                temperature=EVAL_TEMPERATURE,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            text = response.content[0].text
+            text = prompt_runner(prompt, EVAL_TEMPERATURE)
             scores = parse_eval_response(text, persona)
 
             if scores is None:
-                print(f"  WARNING: Failed to parse run {run+1} for {persona['name']}, retrying...", file=sys.stderr)
-                # Retry once
-                response = client.messages.create(
-                    model=MODEL,
-                    max_tokens=2000,
-                    temperature=0.5,
-                    messages=[{"role": "user", "content": prompt}],
+                print(
+                    f"  WARNING: Failed to parse run {run+1} for {persona['name']} "
+                    f"via {provider_label}, retrying...",
+                    file=sys.stderr,
                 )
-                text = response.content[0].text
+                # Retry once
+                text = prompt_runner(prompt, 0.5)
                 scores = parse_eval_response(text, persona)
 
             if scores is not None:
@@ -289,8 +406,40 @@ def compute_summary(persona_medians: dict[str, dict[str, float]], focus_points: 
 # Main
 # ---------------------------------------------------------------------------
 
+def load_personas(personas_dir: Path) -> list[dict]:
+    persona_files = sorted(
+        p for p in personas_dir.glob("*.md")
+        if not p.name.startswith("_")
+    )
+
+    personas = []
+    malformed = []
+    for path in persona_files:
+        if path.stem in READER_PERSONAS:
+            continue
+        persona = parse_persona_file(path)
+        if persona["dimensions"]:
+            personas.append(persona)
+        else:
+            malformed.append(path.stem)
+
+    if malformed:
+        raise ValueError(
+            "Evaluator personas missing rubric dimensions: "
+            + ", ".join(malformed)
+            + ". Fix the persona markdown or rename the file if it is a reader-only persona."
+        )
+
+    return personas
+
+
 def main():
     base_dir = BASE_DIR
+    try:
+        provider = normalize_provider(PROVIDER)
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
 
     # Load draft (prefer data/draft.md from the iteration loop, fall back to draft.md)
     draft_path = base_dir / "data" / "draft.md"
@@ -307,15 +456,15 @@ def main():
         print("ERROR: personas/ directory not found", file=sys.stderr)
         sys.exit(1)
 
-    persona_files = sorted(
-        p for p in personas_dir.glob("*.md")
-        if not p.name.startswith("_")
-    )
-    if not persona_files:
+    try:
+        personas = load_personas(personas_dir)
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+    if not personas:
         print("ERROR: No persona files found in personas/", file=sys.stderr)
         sys.exit(1)
 
-    personas = [parse_persona_file(p) for p in persona_files]
     print(f"Loaded {len(personas)} personas: {', '.join(p['name'] for p in personas)}", file=sys.stderr)
 
     # Load focus points from config.toml
@@ -329,14 +478,22 @@ def main():
     total = sum(focus_points.values())
     print(f"Focus points: {focus_points} (total: {total})", file=sys.stderr)
 
-    # Initialize API client
-    client = anthropic.Anthropic()
+    try:
+        prompt_runner, resolved_provider, resolved_model = build_prompt_runner(provider)
+    except RuntimeError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print(
+        f"Using eval provider: {resolved_provider} (model={resolved_model})",
+        file=sys.stderr,
+    )
 
     # Evaluate each persona
     persona_medians = {}
     for persona in personas:
         print(f"\nEvaluating: {persona['name']} ({EVAL_RUNS} runs)...", file=sys.stderr)
-        runs = evaluate_persona(client, persona, draft)
+        runs = evaluate_persona(prompt_runner, persona, draft, resolved_provider)
 
         if len(runs) < 2:
             print(f"WARNING: Only {len(runs)} valid runs for {persona['name']}", file=sys.stderr)

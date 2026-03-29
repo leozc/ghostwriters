@@ -2,9 +2,11 @@
 # This file is read by evaluate.py and the agent loop.
 
 [eval]
-model = "claude-opus-4-6"       # model for persona evaluations
+provider = "anthropic"          # preferred evaluator; falls back to Codex/OpenAI if ANTHROPIC_API_KEY is unavailable
+model = "claude-opus-4-6"       # Anthropic model for persona evaluations
+openai_model = "gpt-5.4"        # used when provider=openai/codex, or when Anthropic falls back to Codex/OpenAI
 runs = 3                        # evaluations per persona (median for noise reduction)
-temperature = 0.7               # variance across eval runs
+temperature = 0.7               # used by Anthropic; ignored by the Codex/OpenAI evaluator path
 min_improvement = 0.5           # min_score must improve by this to keep
 mean_improvement = 0.3          # mean_score tiebreaker threshold
 
