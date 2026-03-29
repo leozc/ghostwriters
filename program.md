@@ -10,7 +10,8 @@ Before anything else, verify dependencies are available:
 # Required tools
 uv --version          # uv package manager (for running Python scripts)
 git --version         # git (for branch management and ratchet)
-codex --version       # OpenAI Codex CLI (for dual-model reader comments)
+codex --version       # OpenAI Codex CLI (default evaluator + reader path)
+codex login status    # should report a working Codex login
 
 # If any are missing, tell the user:
 #   uv:    curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -21,7 +22,10 @@ codex --version       # OpenAI Codex CLI (for dual-model reader comments)
 uv sync
 ```
 
-If `codex` is not installed, the loop can still run with Claude-only readers (skip the Codex CLI calls in step 6). Tell the user and proceed.
+Read `config.toml` before starting:
+- If `[eval].provider = "anthropic"` and `ANTHROPIC_API_KEY` is present, use Anthropic for evaluator runs.
+- If `[eval].provider = "anthropic"` but `ANTHROPIC_API_KEY` is missing, fall back to Codex/OpenAI for evaluator runs.
+- If `[eval].provider = "openai"` or `"codex"`, Codex CLI is required and must be logged in.
 
 ## Setup
 
@@ -261,7 +265,7 @@ LOOP FOREVER:
    uv run data.py save-scores <persona_name> '<SCORES_JSON>'
    ```
 
-   **2 Claude Reader agents** (HN + X):
+   **2 Claude Reader agents** (HN + X, optional if Anthropic is available):
    ```
    # HN Reader
    Read personas/hn_reader.md and draft.md. Write 3 HN comments. Return prefixed with HN_COMMENTS:
@@ -275,7 +279,7 @@ LOOP FOREVER:
    uv run data.py save-comment claude x '<comments>'
    ```
 
-   **2 Codex Reader agents** via CLI (run in parallel with the above):
+   **2 Codex Reader agents** via CLI (run in parallel with the above, or use these as the default reader path if Anthropic is unavailable):
    ```bash
    codex exec "Read personas/hn_reader.md and draft.md. Write 3 HN-style comments as that persona (2-5 sentences, terse). Do NOT edit files." 2>&1
    codex exec "Read personas/x_reader.md and draft.md. Write 3 X reactions as that persona (1-3 sentences, punchy). Do NOT edit files." 2>&1
@@ -295,7 +299,7 @@ LOOP FOREVER:
    - If min_score same AND mean_score improved by >= mean_improvement: **keep**
    - Otherwise: **discard** and `git reset --hard HEAD~1`
 
-10. **Aggregate comments**: combine all 4 reader outputs (claude_hn, claude_x, codex_hn, codex_x) into `comments.md` for the writer to read next iteration.
+10. **Aggregate comments**: combine whichever reader outputs exist (`claude_hn`, `claude_x`, `codex_hn`, `codex_x`) into `comments.md` for the writer to read next iteration.
 
 11. **Check stopping criteria**: if min_score >= threshold from config.toml, announce completion.
 

@@ -17,6 +17,9 @@ status:
 score:
 	uv run score.py scores.json
 
+eval:
+	uv run evaluate.py
+
 finalize-keep:
 	uv run data.py finalize keep
 
@@ -26,10 +29,10 @@ finalize-discard:
 
 # Testing
 test:
-	uv run python -m unittest test_data -v
+	uv run python -m unittest discover -p 'test_*.py' -v
 
 # Cleanup
 clean:
 	rm -rf data/
 
-.PHONY: init new status score finalize-keep finalize-discard test clean
+.PHONY: init new status score eval finalize-keep finalize-discard test clean
