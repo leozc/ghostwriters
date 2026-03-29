@@ -1,0 +1,21 @@
+# ghostwriter configuration
+# This file is read by evaluate.py and the agent loop.
+
+[eval]
+model = "claude-opus-4-6"       # model for persona evaluations
+runs = 3                        # evaluations per persona (median for noise reduction)
+temperature = 0.7               # variance across eval runs
+min_improvement = 0.5           # min_score must improve by this to keep
+mean_improvement = 0.3          # mean_score tiebreaker threshold
+
+[stopping]
+min_score_target = 7            # stop when min_score >= this across all personas
+
+[focus]
+# Distribute 100 points across personas.
+# Higher points = agent prioritizes improving this persona's weak dimensions first.
+# Keys must match filenames in personas/ (without .md extension).
+investor = 30
+vp_engineering = 25
+senior_developer = 25
+engineer = 20

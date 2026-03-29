@@ -1,0 +1,10 @@
+data/
+results.tsv
+comments.md
+scores.json
+run.log
+__pycache__/
+.venv/
+.git_backup/
+*.pyc
+.DS_Store
