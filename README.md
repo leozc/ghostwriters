@@ -1,197 +1,153 @@
 # ghostwriter
 
-Autonomous blog post optimization inspired by [autoresearch](https://github.com/karpathy/autoresearch). An AI agent loop that iteratively improves a blog post using multi-persona evaluation, dual-model reader critics, and a ratchet that only keeps improvements.
+**[autoresearch](https://github.com/karpathy/autoresearch), but for writing.**
 
-## How it works
+Karpathy's autoresearch showed that an autonomous loop of "try, evaluate, keep or discard" can optimize research code without human intervention. Ghostwriter applies the same idea to prose.
 
-```
-                    +---------------+
-                    |  goal.md      |  Human sets direction, tone, constraints
-                    |  config.toml  |  Human sets persona weights (focus points)
-                    +-------+-------+
-                            |
-                    +-------v-------+
-                    | Writer Agent  |  Edits data/draft.md (one edit per iteration)
-                    | writer.md     |  Reads: voice config, eval feedback, reader comments
-                    +-------+-------+
-                            |
-                       git commit
-                            |
-               +------------+------------+
-               |            |            |
-      +--------v---+ +-----v-----+ +---v--------+
-      | Evaluator  | | 2 Claude  | | 2 Codex    |
-      | Personas   | | Readers   | | Readers    |
-      | (parallel) | | (HN + X)  | | (HN + X)  |
-      +--------+---+ +-----+-----+ +---+--------+
-               |            |            |
-               |    data.py save-scores  |
-               |    data.py save-comment |
-               +-----------+-------------+
-                            |
-                     data.py finalize
-                            |
-                    +-------v-------+
-                    | Keep/Discard  |  min_score improved by >=0.5? Keep.
-                    |  (ratchet)    |  Otherwise revert.
-                    +-------+-------+
-                            |
-                       Loop forever
-```
+You write the first draft. Ghostwriter assembles a **panel of AI agents** -- each one a different expert persona (investor, engineer, VP, end user) -- and has them score your draft independently, in parallel. A separate set of **reader agents** (simulating Hacker News commenters and X/Twitter reactions) poke holes from the outside. Two different foundation models (Claude and GPT via Codex) serve as readers so you get genuine disagreement, not echo-chamber feedback.
 
-## Quick start
+Then a **writer agent** reads all the scores and comments, diagnoses the weakest point, and makes one surgical edit. The loop commits, re-evaluates, and keeps the edit only if the weakest score improved. If not, it reverts. **Your draft never gets worse. It only gets sharper.**
 
-### Prerequisites
+The result: a blog post that has been stress-tested against multiple expert perspectives, tightened by a style-aware editor, and validated by readers from two competing AI models -- all while you were getting coffee.
 
-- [uv](https://docs.astral.sh/uv/) (Python package manager)
-- [git](https://git-scm.com/)
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (the agent loop runs inside Claude Code)
-- [OpenAI Codex CLI](https://github.com/openai/codex) (optional, for dual-model reader comments)
-- `ANTHROPIC_API_KEY` set in your environment
+---
 
-### Setup
+## Get started in 3 steps
+
+### 1. Bring your draft and set the article goal
 
 ```bash
-# 1. Clone the repo
-git clone https://github.com/YOUR_USERNAME/ghostwriter.git
-cd ghostwriter
-
-# 2. Install dependencies
-uv sync
-
-# 3. Configure for your blog post
-#    Edit these files for your domain:
-#    - goal.md           -- the article goal: what the post should accomplish
-#    - writer_config.md  -- author voice and tone
-#    - config.toml       -- persona weights and eval thresholds
-#    - personas/*.md     -- your evaluation panel (see "Creating personas" below)
-
-# 4. Initialize with your draft
-make init DRAFT=path/to/your_draft.md
-
-# 5. Run tests (optional, verifies setup)
-make test
-
-# 6. Start the loop (in Claude Code)
-#    Prompt: "Read program.md and let's kick off a new experiment."
+git clone https://github.com/leozc/ghostwriters.git
+cd ghostwriters && uv sync
 ```
 
-### What happens next
+Drop your blog post draft into the repo (e.g. `myblog.md`), then edit **`goal.md`** to tell ghostwriter what the article should accomplish: the thesis, the tone, what must be included, what to avoid.
 
-Claude Code reads `program.md` and runs the optimization loop autonomously:
+`goal.md` is the north star. The writer agent and every evaluator reads it.
 
-1. Evaluates the draft against your persona panel (parallel subagents)
-2. Collects reader reactions from Claude and Codex (HN + X personas)
-3. Spawns the writer agent to make one focused edit targeting the weakest dimension
-4. Commits, re-evaluates, keeps or discards based on the ratchet
-5. Loops until the stopping criteria is met or you interrupt
+### 2. (Optional) Tune the personas and voice
 
-You can interrupt at any time to provide additional context, facts, or direction. The writer agent incorporates your input using the configured voice.
+The repo ships with ready-to-use example personas. Customize if you want:
 
-## File structure
+| File | What it controls |
+|---|---|
+| `personas/*.md` | Your evaluation panel. Who reads and scores the draft. Copy `_template.md` to create new ones. |
+| `config.toml` | Focus points: distribute 100 points across personas. Higher = writer prioritizes that reader. |
+| `writer_config.md` | Author voice and tone (CEO vs CTO, visionary vs practical, formal vs conversational). |
+| `writer.md` | Writing style rules: anti-AI-slop patterns, editing approach, what good prose sounds like. |
 
-```
-ghostwriter/                  The system (ships clean, no runtime data)
-|-- program.md                Orchestrator instructions (the "skill")
-|-- writer.md                 Writer agent: writing style rules, anti-AI-slop, professional editor
-|-- writer_config.md          Configurable voice/tone (CEO vs CTO, visionary vs practical)
-|-- goal.md                   Article goal: what the post should accomplish, tone, constraints
-|-- config.toml               Focus points, eval thresholds, stopping criteria
-|-- evaluate.md               Evaluation protocol (fixed, do not modify)
-|-- personas/                 One file per persona
-|   |-- _template.md          Template for creating new personas
-|   |-- investor.md           Example: Series A developer tools investor
-|   |-- vp_engineering.md     Example: VP Engineering with budget authority
-|   |-- senior_developer.md   Example: Senior developer (daily user)
-|   |-- engineer.md           Example: Platform engineer (builder)
-|   |-- hn_reader.md          Hacker News reader (critic, not scorer)
-|   +-- x_reader.md           X / Twitter reader (critic, not scorer)
-|-- data.py                   Iteration data management (CLI)
-|-- evaluate.py               Standalone evaluation harness (API-based)
-|-- score.py                  Scoring math (medians, aggregates)
-|-- test_data.py              Unit tests
-|-- Makefile                  Convenience commands
-|-- pyproject.toml            Dependencies
-+-- .gitignore                Excludes data/ (runtime artifacts)
+### 3. Run the loop in Claude Code
 
-data/                         Runtime artifacts (created by `make init`, gitignored)
-|-- draft.md                  Working draft (writer edits this)
-|-- manifest.json             Index of all iterations
-+-- iter_NN/                  One folder per iteration
-    |-- draft.md              Snapshot at this point
-    |-- diff.patch            What changed from previous iteration
-    |-- summary.json          Scores, status, weakest dimension
-    |-- scores/               One file per evaluator persona (parallel safe)
-    +-- comments/             One file per reader source (parallel safe)
+```bash
+make init DRAFT=myblog.md
 ```
 
-## Key concepts
+Then open [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and prompt:
 
-### The ratchet
+```
+Read program.md and start the autoresearch loop from @myblog.md
+```
 
-Like autoresearch's val_bpb, the loop only advances on improvement. An edit that doesn't raise min_score by >= 0.5 (or mean_score by >= 0.3 as a tiebreaker) gets reverted. The draft never gets worse.
+That's it. Walk away. Come back to a better draft.
 
-### Focus points
+---
 
-Distribute 100 points across personas in `config.toml`. Higher points = the writer prioritizes that persona's weak dimensions first. A persona at 40 points matters 4x more than one at 10.
+## How the multi-agent loop works
 
-### Dual-model readers
+Each iteration spawns **8+ agents in parallel**:
 
-After each iteration, the draft gets reviewed by 4 reader agents: Claude as HN reader, Claude as X reader, Codex (GPT) as HN reader, Codex as X reader. Different models catch different things. Both models agreeing on a critique means it's real.
+```
+  You write the draft + goal.md
+          |
+    Writer Agent              1 agent: makes one surgical edit
+          |
+     git commit
+          |
+    +-----+-----+-----+-----+-----+-----+-----+-----+
+    |     |     |     |     |     |     |     |     |
+   Inv  VP Eng Sr Dev Engr  Claude Claude Codex Codex    8 agents, parallel
+   eval  eval  eval  eval   (HN)   (X)   (HN)   (X)
+    |     |     |     |     |     |     |     |     |
+    +-----+-----+-----+-----+-----+-----+-----+-----+
+          |
+    Keep or Discard       Weakest score improved? Keep. Otherwise git revert.
+          |
+      Loop forever
+```
 
-### Writer agent
+**4 expert evaluators** -- each persona reads the draft independently 3 times (for noise reduction via median) and scores it on 4-6 rubric dimensions. An investor looks for thesis clarity and founder signal. An engineer looks for technical substance and builder energy. A VP looks for cost reality and strategic credibility. They don't agree with each other, and that's the point.
 
-The writer is a professional editor, not a text inserter. It can restructure, merge, split, reorder, cut, or rewrite. It reads focus points, evaluation scores, and reader comments. Writing style rules live in `writer.md` (anti-AI-slop patterns, editing approach, what good writing sounds like). Voice and tone are configurable via `writer_config.md` (author role, tone spectrum, vocabulary).
+**4 reader critics** -- Claude and Codex (GPT) each simulate a Hacker News commenter and an X/Twitter reactor. Two models, two platforms, four distinct voices. Codex tends to be harsher. When both models flag the same weakness, it's real. When only one does, the writer weighs it but doesn't over-rotate.
+
+**1 writer agent** -- reads all scores, all comments, the focus point weights, and the voice config. Diagnoses the single highest-impact weakness and makes one focused edit. Not a text inserter: a professional editor that can restructure, merge, split, cut, or rewrite.
+
+**The ratchet** -- every edit is evaluated. If the weakest score doesn't improve by >= 0.5, the commit is reverted. The draft monotonically improves, like autoresearch's val_bpb. Bad edits are never kept.
+
+**Focus points** -- you distribute 100 points across personas in `config.toml`. A persona at 40 points matters 4x more than one at 10. The writer fixes the highest-weighted weakness first.
+
+**Human-in-the-loop** -- you can interrupt anytime to inject domain knowledge, facts, or direction. The writer agent incorporates your input in the configured voice and the loop continues. The biggest wins in practice come from these human interrupts, not autonomous iterations.
+
+---
+
+## Prerequisites
+
+- [uv](https://docs.astral.sh/uv/) -- Python package manager
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) -- the agent loop runs here
+- [OpenAI Codex CLI](https://github.com/openai/codex) -- optional, for dual-model reader comments
+- `ANTHROPIC_API_KEY` in your environment
+
+---
 
 ## Customizing for your domain
 
-The repo ships with example personas for a developer tools domain. To use ghostwriter for your own content:
+The example personas target a developer tools audience. To adapt ghostwriter for any domain:
 
-1. **Define your audience** in `personas/`. Copy `_template.md` and fill in:
-   - **Identity**: who they are, what pressures they face (second person)
-   - **What they care about**: what makes them pay attention
-   - **Value proposition lens**: what would make them act (share, buy, take a meeting)
-   - **Rubric**: 4-6 scored dimensions (0-10), each with a "what does 10 look like" description
-   - **Dealbreaker**: what causes an instant zero
+1. **Define your readers** -- copy `personas/_template.md` and fill in identity, rubric (4-6 scored dimensions), and dealbreaker.
+2. **Set the article goal** -- edit `goal.md` with your thesis, tone, must-include/must-avoid lists.
+3. **Configure the voice** -- edit `writer_config.md` for author role, tone spectrum, sentence style.
+4. **Allocate focus** -- distribute 100 points in `config.toml` across your personas.
 
-2. **Set your article goal** in `goal.md`: what the post should accomplish, the tone you want, what must be included or avoided. This is the north star the writer agent and evaluators use.
+---
 
-3. **Configure the voice** in `writer_config.md`: author role, tone spectrum, sentence style, vocabulary. The companion `writer.md` defines the writing style rules (anti-AI-slop patterns, editing approach, structural moves) and can also be customized.
+## Project structure
 
-4. **Allocate focus points** in `config.toml`: distribute 100 points across your personas.
+```
+ghostwriter/
+|-- program.md            Orchestrator instructions (the "brain")
+|-- writer.md             Writing style: anti-AI-slop rules, editing approach
+|-- writer_config.md      Author voice: tone spectrum, vocabulary, sentence style
+|-- goal.md               Article goal: what the post should accomplish
+|-- config.toml           Focus points, eval thresholds, stopping criteria
+|-- evaluate.md           Evaluation protocol (fixed)
+|-- personas/             One file per reader persona
+|-- data.py               Iteration data management CLI
+|-- evaluate.py           Standalone evaluation harness
+|-- score.py              Scoring math (medians, aggregates)
+|-- test_data.py          Unit tests (19 tests)
++-- Makefile              Convenience commands
+```
+
+**Runtime artifacts** (gitignored, created by `make init`):
+
+```
+data/
+|-- draft.md              Working draft (writer edits this)
+|-- manifest.json         Iteration index
++-- iter_NN/              Per-iteration snapshots, scores, comments
+```
+
+---
 
 ## Makefile commands
 
 ```bash
-make init DRAFT=my_post.md        # Bootstrap data/ from a source draft
-make new DESC="added intro stats"  # Start a new iteration
-make status                        # Show iteration history
-make finalize-keep                 # Mark current iteration as kept
-make finalize-discard              # Revert and mark as discarded
+make init DRAFT=my_post.md        # Bootstrap data/ from your draft
 make test                          # Run unit tests
+make status                        # Show iteration history
 make clean                         # Wipe data/ for a fresh run
 ```
 
-## data.py CLI
-
-```bash
-uv run data.py init source.md                              # Initialize
-uv run data.py new "description"                           # New iteration
-uv run data.py save-scores investor '{"runs":[...]}'       # Save persona scores
-uv run data.py save-comment claude hn "1. Good. 2. Fix."   # Save reader comment
-uv run data.py finalize keep                               # Compute scores, update manifest
-uv run data.py status                                      # Show history
-```
-
-## How the evaluation works
-
-Each persona evaluates the draft 3 times (for noise reduction via median). Scores are per-dimension (0-10). The aggregate metrics:
-
-- **min_score**: lowest score across all persona-dimensions. The post is only as strong as its weakest impression.
-- **mean_score**: average across all dimensions. Used as tiebreaker.
-- **weakest**: the specific persona/dimension dragging down the score, weighted by focus points.
-
-The ratchet keeps an edit only if min_score improves by >= 0.5, or (same min_score AND mean_score improves by >= 0.3).
+---
 
 ## License
 
