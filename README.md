@@ -17,7 +17,7 @@ The result: a blog post that has been stress-tested against multiple expert pers
 ### 1. Bring your draft and set the article goal
 
 ```bash
-git clone https://github.com/leozc/ghostwriters.git
+git clone https://github.com/leozc/ghostwriters
 cd ghostwriters && uv sync
 ```
 
