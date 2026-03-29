@@ -4,7 +4,7 @@
 
 Karpathy's autoresearch showed that an autonomous loop of "try, evaluate, keep or discard" can optimize research code without human intervention. Ghostwriter applies the same idea to prose.
 
-You write the first draft. Ghostwriter assembles a **panel of AI agents** -- each one a different expert persona (investor, engineer, VP, end user) -- and has them score your draft independently, in parallel. A separate set of **reader agents** (simulating Hacker News commenters and X/Twitter reactions) poke holes from the outside. By default, the standalone evaluator prefers Anthropic when `ANTHROPIC_API_KEY` is available, and falls back to OpenAI models through your local Codex login when it is not.
+You write the first draft. Ghostwriter assembles a **panel of AI agents** -- each one a different expert persona (investor, engineer, VP, end user) -- and has them score your draft independently, in parallel. A separate set of **reader agents** (simulating Hacker News commenters and X/Twitter reactions) poke holes from the outside. The standalone evaluator prefers Anthropic and falls back to OpenAI through your local Codex login when `ANTHROPIC_API_KEY` is unavailable.
 
 Then a **writer agent** reads all the scores and comments, diagnoses the weakest point, and makes one surgical edit. The loop commits, re-evaluates, and keeps the edit only if the weakest score improved. If not, it reverts. **Your draft never gets worse. It only gets sharper.**
 
@@ -38,7 +38,7 @@ The repo ships with ready-to-use example personas. Customize if you want:
 
 ### 3. Choose your evaluator
 
-The default config prefers Anthropic, but automatically falls back to Codex/OpenAI when no `ANTHROPIC_API_KEY` is present:
+The default config prefers Anthropic, but falls back to Codex/OpenAI when no `ANTHROPIC_API_KEY` is present:
 
 ```toml
 [eval]
@@ -49,19 +49,13 @@ openai_model = "gpt-5.4"
 
 If you want the Anthropic path, export `ANTHROPIC_API_KEY`.
 
-If you do not set `ANTHROPIC_API_KEY`, Ghostwriter will use Codex/OpenAI instead, so make sure Codex is authenticated:
+If you do not set `ANTHROPIC_API_KEY`, Ghostwriter will use Codex/OpenAI instead. Check that Codex is authenticated:
 
 ```bash
 codex login status
 ```
 
-If you are not logged in yet, run:
-
-```bash
-codex login
-```
-
-You can also force Codex/OpenAI explicitly by setting `provider = "openai"` or `provider = "codex"`.
+If needed, run `codex login`. You can also force Codex/OpenAI explicitly by setting `provider = "openai"` or `provider = "codex"`.
 
 ### 4. Run the loop in your agent
 
@@ -104,7 +98,7 @@ Each iteration spawns **8+ agents in parallel**:
 
 **4 expert evaluators** -- each persona reads the draft independently 3 times (for noise reduction via median) and scores it on 4-6 rubric dimensions. An investor looks for thesis clarity and founder signal. An engineer looks for technical substance and builder energy. A VP looks for cost reality and strategic credibility. They don't agree with each other, and that's the point.
 
-**4 reader critics** -- Claude and Codex (GPT) can each simulate a Hacker News commenter and an X/Twitter reactor. Two models, two platforms, four distinct voices. Codex tends to be harsher. When both models flag the same weakness, it's real. When only one does, the writer weighs it but doesn't over-rotate.
+**4 reader critics** -- Claude and Codex (GPT) can simulate a Hacker News commenter and an X/Twitter reactor. Two models, two platforms, four distinct voices. Codex tends to be harsher. When both models flag the same weakness, it's real. When only one does, the writer weighs it but doesn't over-rotate.
 
 **1 writer agent** -- reads all scores, all comments, the focus point weights, and the voice config. Diagnoses the single highest-impact weakness and makes one focused edit. Not a text inserter: a professional editor that can restructure, merge, split, cut, or rewrite.
 

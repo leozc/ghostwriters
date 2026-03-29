@@ -10,7 +10,7 @@ Before anything else, verify dependencies are available:
 # Required tools
 uv --version          # uv package manager (for running Python scripts)
 git --version         # git (for branch management and ratchet)
-codex --version       # OpenAI Codex CLI (default evaluator + reader path)
+codex --version       # OpenAI Codex CLI (reader path + evaluator fallback)
 codex login status    # should report a working Codex login
 
 # If any are missing, tell the user:
