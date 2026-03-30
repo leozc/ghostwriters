@@ -5,7 +5,7 @@ DRAFT ?= draft.md
 # Setup
 init:
 	uv sync
-	uv run data.py init $(DRAFT)
+	uv run data.py init "$(DRAFT)"
 
 # Iteration commands
 new:
