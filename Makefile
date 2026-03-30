@@ -17,6 +17,9 @@ status:
 score:
 	uv run score.py scores.json
 
+history:
+	uv run score_history.py
+
 eval:
 	uv run evaluate.py
 
@@ -35,4 +38,4 @@ test:
 clean:
 	rm -rf data/
 
-.PHONY: init new status score eval finalize-keep finalize-discard test clean
+.PHONY: init new status score history eval finalize-keep finalize-discard test clean
