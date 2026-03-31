@@ -70,7 +70,9 @@ Each iteration evaluates the draft against multiple personas using **subagents**
 
 **DO NOT call the Anthropic API directly. Use subagents.**
 
-For each persona in `personas/` (excluding `_template.md`), spawn a subagent **in parallel** (all personas at once in a single message with multiple Agent tool calls). Each subagent:
+**CRITICAL: Each persona MUST be evaluated by a SEPARATE subagent.** Never combine multiple personas into a single agent call. Combining personas in one agent creates cross-contamination: the agent anchors on one persona's scores when evaluating the next. Independent subagents produce more honest, varied scores.
+
+For each persona in `personas/` (excluding `_template.md`), spawn a subagent **in parallel** (all personas at once in a single message with multiple Agent tool calls). Each subagent reads ONLY its own persona file and the draft. Each subagent:
 
 1. Reads the persona file (`personas/<name>.md`)
 2. Reads `draft.md`
@@ -258,7 +260,7 @@ LOOP FOREVER:
 
 6. **git commit**: `git -c commit.gpgsign=false commit -m "ghostwriter: <description>"`
 
-7. **Evaluate + Read**: spawn all agents in parallel:
+7. **Evaluate + Read**: spawn all agents in parallel. **ALL 8 agents (4 evaluators + 2 Claude readers + 2 Codex readers) MUST run every iteration. No exceptions. Reader comments are critical input for the writer agent. Skipping readers means the writer operates blind to how the draft reads to real audiences.**
 
    **4 Evaluator agents** (one per persona in `personas/`, excluding `_template.md` and `hn_reader.md` and `x_reader.md`). Each evaluates 3 times and returns SCORES_JSON. After each returns, save scores:
    ```

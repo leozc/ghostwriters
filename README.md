@@ -145,6 +145,7 @@ ghostwriter/
 |-- data.py               Iteration data management CLI
 |-- evaluate.py           Standalone evaluation harness
 |-- score.py              Scoring math (medians, aggregates)
+|-- score_history.py      Dimension score evolution across iterations
 |-- test_data.py          Unit tests (19 tests)
 +-- Makefile              Convenience commands
 ```
@@ -166,6 +167,7 @@ data/
 make init DRAFT=my_post.md        # Bootstrap data/ from your draft
 make test                          # Run unit tests
 make status                        # Show iteration history
+make history                       # Show dimension score evolution across iterations
 make clean                         # Wipe data/ for a fresh run
 ```
 
