@@ -2,7 +2,7 @@
 # This file is read by evaluate.py and the agent loop.
 
 [eval]
-provider = "anthropic"          # preferred evaluator; falls back to Codex/OpenAI if ANTHROPIC_API_KEY is unavailable
+provider = "codex"              # use Codex/OpenAI CLI for evaluations (Claude Code handles orchestration + writing)
 model = "claude-opus-4-6"       # Anthropic model for persona evaluations
 openai_model = "gpt-5.4"        # used when provider=openai/codex, or when Anthropic falls back to Codex/OpenAI
 runs = 3                        # evaluations per persona (median for noise reduction)
@@ -13,11 +13,47 @@ mean_improvement = 0.3          # mean_score tiebreaker threshold
 [stopping]
 min_score_target = 7            # stop when min_score >= this across all personas
 
-[focus]
-# Distribute 100 points across personas.
-# Higher points = agent prioritizes improving this persona's weak dimensions first.
+# Platform selection: set target to "xhs", "x", or "substack"
+# Only evaluators assigned to the target platform (+ universals) will run.
+[platform]
+target = "xhs"
+
+# Platform -> evaluator mapping
+# "universal" evaluators run on every platform.
+[platform.universal]
+evaluators = ["sharp_peer"]
+
+[platform.xhs]
+evaluators = ["xhs_dev_diaspora", "young_aspirant", "diaspora_observer", "vc_watcher"]
+readers = ["xhs_commenter"]
+
+[platform.x]
+evaluators = ["xhs_dev_diaspora", "diaspora_observer"]
+readers = ["x_replier"]
+
+[platform.substack]
+evaluators = ["substack_subscriber", "vc_watcher"]
+readers = ["x_replier", "xhs_commenter"]
+
+# Focus points per platform.
+# Distribute 100 points across evaluators active on that platform.
 # Keys must match filenames in personas/ (without .md extension).
-investor = 30
-vp_engineering = 25
-senior_developer = 25
-engineer = 20
+# Not all evaluators need to be active for every post — pick 3-4 most relevant
+# and redistribute 100 points accordingly before running.
+[focus.xhs]
+sharp_peer = 15
+xhs_dev_diaspora = 30
+young_aspirant = 20
+diaspora_observer = 20
+vc_watcher = 15
+
+[focus.x]
+sharp_peer = 30
+xhs_dev_diaspora = 40
+diaspora_observer = 30
+
+[focus.substack]
+sharp_peer = 30
+substack_subscriber = 45
+vc_watcher = 25
+
