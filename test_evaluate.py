@@ -26,23 +26,31 @@ class TestEvaluatePy(TestCase):
     def test_load_personas_skips_reader_files_without_rubrics(self):
         personas = evaluate.load_personas(Path(__file__).parent / "personas")
         names = [persona["name"] for persona in personas]
-        self.assertIn("investor", names)
-        self.assertIn("engineer", names)
-        self.assertNotIn("hn_reader", names)
-        self.assertNotIn("x_reader", names)
+        # Should include scoring personas (have rubric dimensions)
+        self.assertIn("sharp_peer", names)
+        self.assertIn("xhs_dev_diaspora", names)
+        # Should not include reader personas (no rubric dimensions)
+        self.assertNotIn("xhs_commenter", names)
+        self.assertNotIn("x_replier", names)
+
+    def test_load_personas_with_evaluator_filter(self):
+        personas = evaluate.load_personas(
+            Path(__file__).parent / "personas",
+            evaluator_filter=["sharp_peer", "xhs_dev_diaspora"],
+        )
+        names = [p["name"] for p in personas]
+        self.assertEqual(sorted(names), ["sharp_peer", "xhs_dev_diaspora"])
 
     def test_load_personas_errors_on_non_reader_without_rubric(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             personas_dir = Path(tmpdir)
-            (personas_dir / "hn_reader.md").write_text(
-                "# Persona: Reader\n\n## Identity\nReader only.\n"
-            )
+            # A file explicitly listed as evaluator but with no rubric dimensions
             (personas_dir / "broken_eval.md").write_text(
                 "# Persona: Broken Eval\n\n## Identity\nYou are...\n\n## Rubric\n"
             )
 
             with self.assertRaises(ValueError):
-                evaluate.load_personas(personas_dir)
+                evaluate.load_personas(personas_dir, evaluator_filter=["broken_eval"])
 
     @patch("evaluate.subprocess.run")
     def test_run_codex_prompt_uses_output_file(self, mock_run):

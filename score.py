@@ -35,7 +35,16 @@ def main():
     raw = json.loads(scores_path.read_text())
 
     config = load_config()
-    focus_points = {k: int(v) for k, v in config.get("focus", {}).items()}
+
+    # Resolve focus points: prefer platform-specific, fall back to flat
+    platform = config.get("platform", {})
+    target = platform.get("target")
+    focus_section = config.get("focus", {})
+    if target and target in focus_section and isinstance(focus_section[target], dict):
+        focus_points = {k: int(v) for k, v in focus_section[target].items()}
+    else:
+        focus_points = {k: int(v) for k, v in focus_section.items()
+                        if not isinstance(v, dict)}
     total_focus = sum(focus_points.values()) or 1
 
     all_scores = []

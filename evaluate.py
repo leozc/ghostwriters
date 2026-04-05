@@ -37,7 +37,43 @@ EVAL_TEMPERATURE = CONFIG["eval"]["temperature"]
 MIN_SCORE_THRESHOLD = CONFIG["eval"]["min_improvement"]
 MEAN_SCORE_THRESHOLD = CONFIG["eval"]["mean_improvement"]
 FOCUS_POINTS = CONFIG.get("focus", {})
-READER_PERSONAS = {"hn_reader", "x_reader"}
+
+
+def get_platform_config(config: dict) -> dict:
+    """Resolve platform target and return evaluators, readers, and focus points."""
+    platform = config.get("platform", {})
+    target = platform.get("target")
+
+    if not target:
+        # Legacy: no platform config, use all personas with flat [focus]
+        return {
+            "target": None,
+            "evaluators": None,
+            "readers": None,
+            "focus": {k: int(v) for k, v in config.get("focus", {}).items()
+                      if not isinstance(v, dict)},
+        }
+
+    # Merge universal + platform-specific evaluators
+    universal = platform.get("universal", {}).get("evaluators", [])
+    plat_cfg = platform.get(target, {})
+    evaluators = universal + plat_cfg.get("evaluators", [])
+    readers = plat_cfg.get("readers", [])
+
+    # Focus: try [focus.<target>], fall back to flat [focus]
+    focus_section = config.get("focus", {})
+    if target in focus_section and isinstance(focus_section[target], dict):
+        focus = {k: int(v) for k, v in focus_section[target].items()}
+    else:
+        focus = {k: int(v) for k, v in focus_section.items()
+                 if not isinstance(v, dict)}
+
+    return {
+        "target": target,
+        "evaluators": evaluators,
+        "readers": readers,
+        "focus": focus,
+    }
 
 # ---------------------------------------------------------------------------
 # Parsing
@@ -406,7 +442,12 @@ def compute_summary(persona_medians: dict[str, dict[str, float]], focus_points: 
 # Main
 # ---------------------------------------------------------------------------
 
-def load_personas(personas_dir: Path) -> list[dict]:
+def load_personas(personas_dir: Path, evaluator_filter: list[str] | None = None) -> list[dict]:
+    """Load evaluator personas from personas/.
+
+    If evaluator_filter is provided, only load personas whose stem is in the list.
+    If None, load all personas that have rubric dimensions (auto-detect evaluators).
+    """
     persona_files = sorted(
         p for p in personas_dir.glob("*.md")
         if not p.name.startswith("_")
@@ -415,19 +456,21 @@ def load_personas(personas_dir: Path) -> list[dict]:
     personas = []
     malformed = []
     for path in persona_files:
-        if path.stem in READER_PERSONAS:
+        if evaluator_filter is not None and path.stem not in evaluator_filter:
             continue
+
         persona = parse_persona_file(path)
         if persona["dimensions"]:
             personas.append(persona)
-        else:
+        elif evaluator_filter is not None and path.stem in evaluator_filter:
             malformed.append(path.stem)
+        # else: reader persona (no dimensions), skip silently
 
     if malformed:
         raise ValueError(
             "Evaluator personas missing rubric dimensions: "
             + ", ".join(malformed)
-            + ". Fix the persona markdown or rename the file if it is a reader-only persona."
+            + ". Fix the persona markdown or remove from platform evaluators list."
         )
 
     return personas
@@ -441,6 +484,9 @@ def main():
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
 
+    # Resolve platform config
+    platform_cfg = get_platform_config(CONFIG)
+
     # Load draft (prefer data/draft.md from the iteration loop, fall back to draft.md)
     draft_path = base_dir / "data" / "draft.md"
     if not draft_path.exists():
@@ -450,25 +496,26 @@ def main():
         sys.exit(1)
     draft = draft_path.read_text()
 
-    # Load personas (all .md files in personas/ except _template.md)
+    # Load personas filtered by platform evaluator list
     personas_dir = base_dir / "personas"
     if not personas_dir.exists():
         print("ERROR: personas/ directory not found", file=sys.stderr)
         sys.exit(1)
 
     try:
-        personas = load_personas(personas_dir)
+        personas = load_personas(personas_dir, platform_cfg["evaluators"])
     except ValueError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
     if not personas:
-        print("ERROR: No persona files found in personas/", file=sys.stderr)
+        print("ERROR: No evaluator personas found", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Loaded {len(personas)} personas: {', '.join(p['name'] for p in personas)}", file=sys.stderr)
+    target_label = f" (platform: {platform_cfg['target']})" if platform_cfg["target"] else ""
+    print(f"Loaded {len(personas)} evaluators{target_label}: {', '.join(p['name'] for p in personas)}", file=sys.stderr)
 
-    # Load focus points from config.toml
-    focus_points = load_focus_points()
+    # Load focus points from platform config
+    focus_points = dict(platform_cfg["focus"])
 
     # Default: equal weight if not specified
     for p in personas:

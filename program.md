@@ -1,6 +1,6 @@
 # ghostwriter
 
-This is an experiment to have an LLM autonomously improve a blog post, inspired by [autoresearch](https://github.com/karpathy/autoresearch).
+This is an experiment to have an LLM autonomously improve a post, inspired by [autoresearch](https://github.com/karpathy/autoresearch).
 
 ## Preflight checks
 
@@ -33,25 +33,26 @@ To set up a new optimization run, work with the user to:
 
 1. **Agree on a run tag**: propose a tag based on today's date and the post topic (e.g. `bitter-lesson-mar29`). The branch `ghostwriter/<tag>` must not already exist.
 2. **Create the branch**: `git checkout -b ghostwriter/<tag>` from current state.
-3. **Initialize data/**: `uv run data.py init <path_to_source_draft>`. This creates `data/draft.md` as the working copy. All autoresearch artifacts will live in `data/`.
-4. **Read the in-scope files**:
+3. **Select platform**: Read `config.toml [platform].target` to see which platform is active (`xhs`, `x`, or `substack`). Confirm with the user. Change if needed.
+4. **Initialize data/**: `uv run data.py init <path_to_source_draft>`. This creates `data/draft.md` as the working copy.
+5. **Read the in-scope files**:
    - `goal.md` -- what the post should accomplish, tone, constraints, stopping criteria.
-   - `config.toml` -- thresholds and focus point allocation.
-   - `personas/*.md` -- the evaluation panel and their rubrics (one file per persona).
+   - `config.toml` -- platform config, thresholds, and focus point allocation.
+   - `personas/*.md` -- the evaluation panel and their rubrics. Only personas listed in `[platform.<target>]` and `[platform.universal]` are active.
    - `writer.md` + `writer_config.md` -- writer agent instructions and voice config.
-   - `data/draft.md` -- the blog post you will be improving. **This is the working draft. All edits go here.**
-5. **Allocate focus points**: Present the loaded personas to the user and ask them to distribute 100 focus points. Show the current allocation from `config.toml` as a default. Update `config.toml` with the user's allocation.
-6. **Confirm and go**: Confirm setup looks good with the user.
+   - `data/draft.md` -- the post you will be improving. **This is the working draft. All edits go here.**
+6. **Review active evaluators and readers**: Based on the platform config, list which evaluators and readers will run. Show the focus points from `[focus.<platform>]`.
+7. **Confirm and go**: Confirm setup looks good with the user.
 
 Once you get confirmation, kick off the experimentation.
 
 ## Experimentation
 
-Each iteration evaluates the draft against multiple personas using **subagents**.
+Each iteration evaluates the draft against platform-specific personas using **subagents**.
 
 **What you CAN do:**
-- Modify `data/draft.md` — this is the only file you edit. Everything is fair game: structure, tone, arguments, evidence, examples, section ordering, additions, deletions.
-- Create files in `research/` — save web research findings here for reference across iterations.
+- Modify `data/draft.md` -- this is the only file you edit. Everything is fair game: structure, tone, arguments, evidence, examples, section ordering, additions, deletions.
+- Create files in `research/` -- save web research findings here for reference across iterations.
 - Use `WebSearch` to find data, statistics, market information, regulatory developments.
 - Use `/browse` (gstack skill) to read specific web pages in depth.
 
@@ -60,11 +61,21 @@ Each iteration evaluates the draft against multiple personas using **subagents**
 - Modify `personas/*.md` or `goal.md`. These are set by the human.
 - Install new packages or add dependencies beyond what's in `pyproject.toml`.
 
-**The goal is simple: get the highest min_score.** The min_score is the lowest score across ALL persona-rubric dimensions. The post is only as strong as its weakest impression. Everything is fair game: restructure, rewrite sections, add evidence, remove fluff, sharpen arguments, add examples.
+**The goal is simple: get the highest min_score.** The min_score is the lowest score across ALL active evaluator dimensions. The post is only as strong as its weakest impression. Everything is fair game: restructure, rewrite sections, add evidence, remove fluff, sharpen arguments, add examples.
 
 **Simplicity criterion**: All else being equal, cleaner prose is better. A small score improvement that adds bloated paragraphs is not worth it. A score improvement from deleting weak content? Definitely keep. An equal score but tighter, sharper writing? Keep.
 
-**The first run**: Your very first run should always be to establish the baseline — evaluate the draft as-is.
+## Discovery phase (iteration 0)
+
+**The first run establishes a baseline and optionally discovers which evaluators to keep.**
+
+1. Evaluate the draft as-is against ALL evaluators for the target platform.
+2. After scoring, run: `uv run data.py discover`
+3. This analyzes scores and recommends which evaluators to keep:
+   - **Keep**: evaluators with 2+ point spread across dimensions (discriminating) or any dimension below 6 (has weaknesses to improve)
+   - **Consider dropping**: evaluators scoring uniformly high (not adding signal)
+4. Review the recommendation with the user. If adjustments are needed, update `config.toml` focus points.
+5. From iteration 1 onward, the evaluator set is locked for the optimization loop.
 
 ## Evaluation via subagents
 
@@ -72,24 +83,25 @@ Each iteration evaluates the draft against multiple personas using **subagents**
 
 **CRITICAL: Each persona MUST be evaluated by a SEPARATE subagent.** Never combine multiple personas into a single agent call. Combining personas in one agent creates cross-contamination: the agent anchors on one persona's scores when evaluating the next. Independent subagents produce more honest, varied scores.
 
-For each persona in `personas/` (excluding `_template.md`), spawn a subagent **in parallel** (all personas at once in a single message with multiple Agent tool calls). Each subagent reads ONLY its own persona file and the draft. Each subagent:
+### Which personas to evaluate
 
-1. Reads the persona file (`personas/<name>.md`)
-2. Reads `draft.md`
-3. Evaluates the draft 3 times from that persona's perspective
-4. Returns structured JSON scores
+Read `config.toml` to determine active personas:
+- Evaluators (scoring): `[platform.universal].evaluators` + `[platform.<target>].evaluators`
+- Readers (qualitative): `[platform.<target>].readers`
 
-### Subagent prompt
+For each **evaluator** persona, spawn a subagent in parallel. For each **reader** persona, spawn a subagent (or use Codex CLI) in parallel. All agents run simultaneously in a single message with multiple Agent tool calls.
 
-For each persona, spawn an Agent with `subagent_type: "general-purpose"` and this prompt:
+### Evaluator subagent prompt
+
+For each evaluator persona, spawn an Agent with `subagent_type: "general-purpose"` and this prompt:
 
 ```
-You are an evaluation agent for ghostwriter. Your job is to evaluate a blog post draft
+You are an evaluation agent for ghostwriter. Your job is to evaluate a post draft
 from the perspective of a specific persona, 3 separate times.
 
 Read these two files:
-- personas/<PERSONA_NAME>.md — your persona identity and rubric
-- draft.md — the blog post to evaluate
+- personas/<PERSONA_NAME>.md -- your persona identity and rubric
+- data/draft.md -- the post to evaluate
 
 For EACH of your 3 evaluation runs:
 1. For each rubric dimension, reference a specific passage from the draft
@@ -114,67 +126,33 @@ Use the exact dimension names from the rubric. Scores must be integers 0-10.
 If the dealbreaker triggers in ANY run, set dealbreaker_triggered: true and all scores to 0.
 ```
 
+### Reader subagent prompt
+
+For each reader persona, spawn an Agent with `subagent_type: "general-purpose"` and this prompt:
+
+```
+You are a reader agent for ghostwriter. Your job is to react to a post draft
+from the perspective of a specific reader persona.
+
+Read these two files:
+- personas/<READER_NAME>.md -- your persona identity and comment instructions
+- data/draft.md -- the post to react to
+
+Follow the "How you comment" / "How you reply" instructions in the persona file exactly.
+Write your comments/reactions. Return them prefixed with:
+
+READER_COMMENTS:
+<your comments here>
+```
+
 ### Collecting results
 
 After all subagents return:
 
-1. Parse the `SCORES_JSON` from each subagent's response
-2. Combine into a single JSON object:
-   ```json
-   {
-     "investor": {"runs": [...], "dealbreaker": false},
-     "vp_engineering": {"runs": [...], "dealbreaker": false},
-     "senior_developer": {"runs": [...], "dealbreaker": false},
-     "engineer": {"runs": [...], "dealbreaker": false}
-   }
-   ```
-3. Write to `scores.json`
-4. Run: `uv run score.py scores.json`
-5. Read the output — this is your score summary
-
-## Output format
-
-`score.py` prints a summary like this:
-
-```
----
-min_score:        5.0
-mean_score:       6.2
-investor_min:     5.5
-vp_engineering_min:       5.0
-senior_developer_min:     6.0
-engineer_min:     6.0
-weakest:          vp_engineering/cost_reality
-```
-
-## Logging results
-
-When an iteration is done, log it to `results.tsv` (tab-separated).
-
-The TSV has a header row and 8 columns:
-
-```
-commit	min_score	mean_score	investor_min	vp_eng_min	sr_dev_min	engineer_min	status	description
-```
-
-1. git commit hash (short, 7 chars)
-2. min_score
-3. mean_score
-4. investor_min (per-persona minimum)
-5. vp_eng_min
-6. sr_dev_min
-7. engineer_min
-8. status: `keep`, `discard`, or `crash`
-9. short text description of what this iteration tried
-
-Example:
-
-```
-commit	min_score	mean_score	investor_min	vp_eng_min	sr_dev_min	engineer_min	status	description
-a1b2c3d	5.0	6.2	5.5	5.0	6.0	6.0	keep	baseline
-b2c3d4e	5.5	6.5	6.0	5.5	6.5	6.0	keep	added industry benchmarks and cost data
-c3d4e5f	5.5	6.3	6.5	5.5	6.0	5.5	discard	tried adding API code examples (felt forced)
-```
+1. Parse the `SCORES_JSON` from each evaluator subagent's response
+2. Save each persona's scores: `uv run data.py save-scores <persona_name> '<SCORES_JSON>'`
+3. Parse the `READER_COMMENTS` from each reader subagent's response
+4. Save each reader's comments: `uv run data.py save-comment <reader_name> '<comments>'`
 
 ## The experiment loop
 
@@ -182,26 +160,11 @@ The loop runs on a dedicated branch (e.g. `ghostwriter/bitter-lesson-mar29`).
 
 ## User input handling
 
-The user may interrupt the loop at any time with additional context, facts, or direction. Examples:
-- "compliance/Cost reality -> usually cost is $20-$40 per L1 investigation..."
-- "add a section about cross-chain tracing"
-- "tone it down in the opening"
-
-When the user provides input:
+The user may interrupt the loop at any time with additional context, facts, or direction. When the user provides input:
 
 1. **Always spawn the Writer agent first.** The writer incorporates the user's context into draft.md using the configured voice/tone. The orchestrator NEVER edits draft.md directly.
-2. **Then commit and evaluate.** Same flow as a normal iteration — commit → evaluate + readers → keep/discard.
-3. **Pass the user's context verbatim to the writer.** Include it in the writer prompt as:
-   ```
-   USER CONTEXT:
-   [exact user input]
-
-   YOUR TASK:
-   Incorporate this context into draft.md. Use the author's voice from writer_config.md.
-   Place it where it flows naturally. Don't just paste it in — write it as the author would.
-   ```
-
-This ensures the user's domain knowledge gets filtered through the writer's voice before evaluation.
+2. **Then commit and evaluate.** Same flow as a normal iteration.
+3. **Pass the user's context verbatim to the writer.**
 
 ---
 
@@ -230,14 +193,14 @@ LOOP FOREVER:
    - writer_config.md -- the author's voice, tone, and style configuration
    - config.toml -- focus points (persona weights)
    - goal.md -- strategic direction and constraints
-   - data/draft.md -- the current blog post (working copy in data/)
-   - comments.md -- latest HN and X reader reactions (if it exists)
+   - data/draft.md -- the current post (working copy in data/)
+   - comments.md -- latest reader reactions (if it exists)
 
    EVALUATION FEEDBACK:
    [paste the score summary + the detailed evaluator reasoning for the weakest dimensions]
 
    READER REACTIONS:
-   [paste the HN and X comments from the previous iteration's reader agents]
+   [paste the reader comments from the previous iteration]
 
    USER CONTEXT (if provided):
    [exact user input, or "None -- autonomous iteration"]
@@ -245,13 +208,13 @@ LOOP FOREVER:
    DIAGNOSIS:
    The weakest persona-dimension is [X/Y] at score [Z] (focus weight: [W]).
    The evaluators said: [key quotes from their reasoning].
-   The HN/X readers reacted: [key quotes from comments.md that are relevant].
+   The readers reacted: [key quotes from comments that are relevant].
 
    YOUR TASK:
    If USER CONTEXT is provided: incorporate that context into draft.md using the author's voice.
    If no user context: make ONE focused edit targeting the diagnosed weakness.
    You may restructure, merge, split, or reorder paragraphs if that's the best editorial move.
-   Apply the edit directly to draft.md using the Edit tool.
+   Apply the edit directly to data/draft.md using the Edit tool.
    Follow writer_config.md for voice and tone. Follow the anti-AI-slop rules in writer.md strictly.
    Explain what you changed and why.
    ```
@@ -260,37 +223,23 @@ LOOP FOREVER:
 
 6. **git commit**: `git -c commit.gpgsign=false commit -m "ghostwriter: <description>"`
 
-7. **Evaluate + Read**: spawn all agents in parallel. **ALL 8 agents (4 evaluators + 2 Claude readers + 2 Codex readers) MUST run every iteration. No exceptions. Reader comments are critical input for the writer agent. Skipping readers means the writer operates blind to how the draft reads to real audiences.**
+7. **Evaluate + Read**: spawn all agents in parallel. ALL evaluator agents + ALL reader agents MUST run every iteration. No exceptions. Reader comments are critical input for the writer agent. Skipping readers means the writer operates blind to how the draft reads to real audiences.
 
-   **4 Evaluator agents** (one per persona in `personas/`, excluding `_template.md` and `hn_reader.md` and `x_reader.md`). Each evaluates 3 times and returns SCORES_JSON. After each returns, save scores:
+   **Evaluator agents** (one per active evaluator persona). Each evaluates 3 times and returns SCORES_JSON. After each returns, save scores:
    ```
    uv run data.py save-scores <persona_name> '<SCORES_JSON>'
    ```
 
-   **2 Claude Reader agents** (HN + X, optional if Anthropic is available):
+   **Reader agents** (one per active reader persona). Each writes comments per their persona instructions. After each returns, save:
    ```
-   # HN Reader
-   Read personas/hn_reader.md and draft.md. Write 3 HN comments. Return prefixed with HN_COMMENTS:
-
-   # X Reader
-   Read personas/x_reader.md and draft.md. Write 3 X reactions. Return prefixed with X_COMMENTS:
-   ```
-   After each returns, save:
-   ```
-   uv run data.py save-comment claude hn '<comments>'
-   uv run data.py save-comment claude x '<comments>'
+   uv run data.py save-comment <reader_name> '<comments>'
    ```
 
-   **2 Codex Reader agents** via CLI (run in parallel with the above, or use these as the default reader path if Anthropic is unavailable):
+   Optionally, run Codex CLI readers in parallel for model diversity:
    ```bash
-   codex exec "Read personas/hn_reader.md and draft.md. Write 3 HN-style comments as that persona (2-5 sentences, terse). Do NOT edit files." 2>&1
-   codex exec "Read personas/x_reader.md and draft.md. Write 3 X reactions as that persona (1-3 sentences, punchy). Do NOT edit files." 2>&1
+   codex exec "Read personas/<reader_name>.md and data/draft.md. Follow the comment instructions exactly. Do NOT edit files." 2>&1
    ```
-   After each returns, save:
-   ```
-   uv run data.py save-comment codex hn '<comments>'
-   uv run data.py save-comment codex x '<comments>'
-   ```
+   Save with a prefixed name: `uv run data.py save-comment codex_<reader_name> '<comments>'`
 
 8. **Finalize scores**: `uv run data.py finalize <keep|discard>`
    This computes medians from per-persona score files, writes summary.json, updates manifest.json.
@@ -301,7 +250,7 @@ LOOP FOREVER:
    - If min_score same AND mean_score improved by >= mean_improvement: **keep**
    - Otherwise: **discard** and `git reset --hard HEAD~1`
 
-10. **Aggregate comments**: combine whichever reader outputs exist (`claude_hn`, `claude_x`, `codex_hn`, `codex_x`) into `comments.md` for the writer to read next iteration.
+10. **Aggregate comments**: combine reader outputs into `comments.md` for the writer to read next iteration.
 
 11. **Check stopping criteria**: if min_score >= threshold from config.toml, announce completion.
 
@@ -324,9 +273,12 @@ Before the loop starts:
 ghostwriter/
 ├── program.md, writer.md, writer_config.md       (read-only system files)
 ├── goal.md, config.toml                           (user config)
-├── personas/*.md                                  (persona definitions)
-├── data.py, score.py                              (CLI tools)
-├── research/                                      (web research findings, persisted across iterations)
+├── personas/                                      (persona definitions)
+│   ├── <evaluator>.md                             (scoring personas with rubrics)
+│   ├── <reader>.md                                (comment-only personas)
+│   └── disabled/                                  (inactive personas)
+├── data.py, evaluate.py, score.py                 (CLI tools)
+├── research/                                      (web research findings)
 └── data/                                          (created by init)
     ├── draft.md                                   (working draft)
     └── manifest.json                              (empty)
@@ -341,16 +293,15 @@ data/
 │   ├── draft.md          <- snapshot at iteration 0
 │   ├── diff.patch        <- empty for baseline
 │   ├── summary.json      <- {id, status, min_score, mean_score, per_persona, weakest}
+│   ├── discovery.json    <- evaluator analysis (baseline only)
 │   ├── scores/           <- one file per evaluator persona (parallel safe)
-│   │   ├── investor.json
-│   │   ├── vp_engineering.json
-│   │   ├── senior_developer.json
-│   │   └── engineer.json
-│   └── comments/         <- one file per reader source (parallel safe)
-│       ├── claude_hn.md
-│       ├── claude_x.md
-│       ├── codex_hn.md
-│       └── codex_x.md
+│   │   ├── sharp_peer.json
+│   │   ├── xhs_dev_diaspora.json
+│   │   └── ...
+│   └── comments/         <- one file per reader (parallel safe)
+│       ├── xhs_commenter.md
+│       ├── x_replier.md
+│       └── ...
 └── iter_NN/
     └── ...
 ```

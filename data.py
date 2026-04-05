@@ -12,12 +12,15 @@ Usage:
     # Save a persona's scores (call once per persona, parallel safe)
     uv run data.py save-scores <persona_name> '<json_scores>'
 
-    # Save reader comments (call once per source+persona, parallel safe)
-    uv run data.py save-comment <source> <persona> '<comment_text>'
-    # source: claude | codex     persona: hn | x
+    # Save reader comments (call once per reader, parallel safe)
+    uv run data.py save-comment <name> '<comment_text>'
+    uv run data.py save-comment <source> <persona> '<comment_text>'  # legacy
 
     # Finalize iteration (compute medians, write summary, update manifest)
     uv run data.py finalize <keep|discard>
+
+    # Analyze baseline and recommend evaluator selection
+    uv run data.py discover
 
     # Show iteration history
     uv run data.py status
@@ -61,6 +64,40 @@ DRAFT_PATH = DATA_DIR / "draft.md"  # working draft lives in data/
 def load_config():
     with open(BASE_DIR / "config.toml", "rb") as f:
         return tomllib.load(f)
+
+
+def get_platform_config(config):
+    """Resolve platform target and return evaluators, readers, and focus points."""
+    platform = config.get("platform", {})
+    target = platform.get("target")
+
+    if not target:
+        return {
+            "target": None,
+            "evaluators": None,
+            "readers": None,
+            "focus": {k: int(v) for k, v in config.get("focus", {}).items()
+                      if not isinstance(v, dict)},
+        }
+
+    universal = platform.get("universal", {}).get("evaluators", [])
+    plat_cfg = platform.get(target, {})
+    evaluators = universal + plat_cfg.get("evaluators", [])
+    readers = plat_cfg.get("readers", [])
+
+    focus_section = config.get("focus", {})
+    if target in focus_section and isinstance(focus_section[target], dict):
+        focus = {k: int(v) for k, v in focus_section[target].items()}
+    else:
+        focus = {k: int(v) for k, v in focus_section.items()
+                 if not isinstance(v, dict)}
+
+    return {
+        "target": target,
+        "evaluators": evaluators,
+        "readers": readers,
+        "focus": focus,
+    }
 
 
 def load_manifest():
@@ -183,17 +220,29 @@ def cmd_save_scores(persona_name, scores_json):
     print(f"saved: {out_path.relative_to(BASE_DIR)}")
 
 
-def cmd_save_comment(source, persona, comment_text):
+def cmd_save_comment(*args):
     """Save one reader comment to its own file. No concurrency issues.
-    source: claude | codex
-    persona: hn | x
+
+    Supports two calling conventions:
+      save-comment <name> '<text>'                 (new: name is the file stem)
+      save-comment <source> <persona> '<text>'     (legacy: joined as source_persona)
     """
+    if len(args) == 3:
+        source, persona, comment_text = args
+        name = f"{source}_{persona}"
+    elif len(args) == 2:
+        name, comment_text = args
+    else:
+        print("Usage: uv run data.py save-comment <name> '<text>'")
+        print("   or: uv run data.py save-comment <source> <persona> '<text>'")
+        sys.exit(1)
+
     manifest = load_manifest()
     iter_dir = current_iter_dir(manifest)
     comments_dir = iter_dir / "comments"
     comments_dir.mkdir(exist_ok=True)
 
-    out_path = comments_dir / f"{source}_{persona}.md"
+    out_path = comments_dir / f"{name}.md"
     out_path.write_text(comment_text + "\n")
     print(f"saved: {out_path.relative_to(BASE_DIR)}")
 
@@ -204,7 +253,8 @@ def cmd_finalize(status):
     iter_dir = current_iter_dir(manifest)
     scores_dir = iter_dir / "scores"
     config = load_config()
-    focus_points = {k: int(v) for k, v in config.get("focus", {}).items()}
+    platform_cfg = get_platform_config(config)
+    focus_points = dict(platform_cfg["focus"])
 
     # Read all persona score files
     persona_medians = {}
@@ -280,6 +330,95 @@ def cmd_finalize(status):
     print(f"status:           {status}")
 
 
+def cmd_discover():
+    """Analyze baseline scores and recommend evaluator selection.
+
+    Run after iteration 0 (baseline) to see which evaluators are providing
+    useful signal and which can be dropped for the optimization loop.
+    """
+    manifest = load_manifest()
+    iter_dir = current_iter_dir(manifest)
+    scores_dir = iter_dir / "scores"
+
+    if not scores_dir.exists() or not list(scores_dir.glob("*.json")):
+        print("ERROR: No score files found. Run evaluation first.", file=sys.stderr)
+        sys.exit(1)
+
+    results = {}
+    for score_file in sorted(scores_dir.glob("*.json")):
+        persona_name = score_file.stem
+        raw = json.loads(score_file.read_text())
+        runs = raw.get("runs", [])
+        dealbreaker = raw.get("dealbreaker", False)
+
+        if not runs:
+            continue
+
+        dimensions = list(runs[0].keys())
+        if dealbreaker:
+            medians = {d: 0.0 for d in dimensions}
+        else:
+            medians = {
+                dim: statistics.median([r[dim] for r in runs])
+                for dim in dimensions
+            }
+
+        scores_list = list(medians.values())
+        avg = statistics.mean(scores_list) if scores_list else 0
+        variance = statistics.variance(scores_list) if len(scores_list) > 1 else 0
+        min_score = min(scores_list) if scores_list else 0
+        max_score = max(scores_list) if scores_list else 0
+        spread = max_score - min_score
+
+        results[persona_name] = {
+            "dimensions": medians,
+            "mean": round(avg, 1),
+            "min": min_score,
+            "variance": round(variance, 2),
+            "spread": round(spread, 1),
+            "discriminating": spread >= 2.0,
+            "has_weakness": min_score <= 6.0,
+        }
+
+    print("=== Discovery: Evaluator Analysis ===\n")
+
+    keep = []
+    consider_dropping = []
+
+    for name, r in sorted(results.items(), key=lambda x: x[1]["variance"], reverse=True):
+        useful = r["discriminating"] or r["has_weakness"]
+        if useful:
+            keep.append(name)
+        else:
+            consider_dropping.append(name)
+
+        marker = "+" if useful else "?"
+        print(f"  {marker} {name}")
+        print(f"    mean={r['mean']}, min={r['min']}, spread={r['spread']}, variance={r['variance']}")
+        dims_str = ", ".join(f"{d}={s}" for d, s in r["dimensions"].items())
+        print(f"    dimensions: {dims_str}")
+        if not r["discriminating"]:
+            print(f"    * Low spread ({r['spread']}) -- not differentiating across dimensions")
+        if not r["has_weakness"]:
+            print(f"    * No dimension below 6 -- not surfacing actionable weaknesses")
+        print()
+
+    print(f"Recommended keep: {', '.join(keep)}")
+    if consider_dropping:
+        print(f"Consider dropping: {', '.join(consider_dropping)}")
+        print("  (uniformly high scores or low variance -- not adding signal for improvement)")
+
+    # Save recommendation
+    discovery = {
+        "keep": keep,
+        "consider_dropping": consider_dropping,
+        "details": results,
+    }
+    discovery_path = iter_dir / "discovery.json"
+    discovery_path.write_text(json.dumps(discovery, indent=2) + "\n")
+    print(f"\nSaved to: {discovery_path.relative_to(BASE_DIR)}")
+
+
 def cmd_status():
     """Show iteration history."""
     manifest = load_manifest()
@@ -326,16 +465,20 @@ def main():
         cmd_save_scores(sys.argv[2], sys.argv[3])
 
     elif cmd == "save-comment":
-        if len(sys.argv) < 5:
-            print("Usage: uv run data.py save-comment <source> <persona> '<text>'")
+        if len(sys.argv) < 4:
+            print("Usage: uv run data.py save-comment <name> '<text>'")
+            print("   or: uv run data.py save-comment <source> <persona> '<text>'")
             sys.exit(1)
-        cmd_save_comment(sys.argv[2], sys.argv[3], sys.argv[4])
+        cmd_save_comment(*sys.argv[2:])
 
     elif cmd == "finalize":
         if len(sys.argv) < 3:
             print("Usage: uv run data.py finalize <keep|discard>")
             sys.exit(1)
         cmd_finalize(sys.argv[2])
+
+    elif cmd == "discover":
+        cmd_discover()
 
     elif cmd == "status":
         cmd_status()
