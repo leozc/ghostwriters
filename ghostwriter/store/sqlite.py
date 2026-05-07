@@ -180,6 +180,17 @@ class Store:
         ).fetchone()
         return dict(row) if row else None
 
+    def read_version_text(self, version_id: str) -> str:
+        """Load the markdown body for a kept version.
+
+        Convenience over get_version() + content.read() so callers
+        (orchestrator) don't need to know the blob layout.
+        """
+        v = self.get_version(version_id)
+        if v is None:
+            raise ValueError(f"version {version_id} not found")
+        return self.content.read(v["content_path"])
+
     # ---- tasks -------------------------------------------------------------
 
     def create_task(self, config: TaskConfig) -> str:
