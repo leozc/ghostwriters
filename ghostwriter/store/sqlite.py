@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import uuid
 from contextlib import contextmanager
 from dataclasses import asdict
@@ -81,11 +82,21 @@ class Store:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.execute("PRAGMA journal_mode = WAL")
+        # Wait up to 5s for a write lock before failing — important for FR10
+        # when two threads/processes race on the same DB file.
+        self._conn.execute("PRAGMA busy_timeout = 5000")
         self._init_schema()
 
         if content_root is None:
             content_root = self._path.parent / "content"
         self.content = ContentStore(content_root)
+        # The design assumes asyncio concurrency (one task per loop). Multiple
+        # OS threads sharing a single connection would otherwise race on the
+        # connection's internal transaction state. The lock makes that safe at
+        # the cost of serializing transactions within one Store instance.
+        # True FR10 concurrency uses one Store per process; SQLite WAL handles
+        # cross-process writes natively.
+        self._tx_lock = threading.Lock()
 
     def _init_schema(self) -> None:
         schema_sql = _SCHEMA_PATH.read_text(encoding="utf-8")
@@ -93,17 +104,23 @@ class Store:
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Cursor]:
-        """Yield a cursor inside an atomic transaction (FR12)."""
-        cur = self._conn.cursor()
-        cur.execute("BEGIN IMMEDIATE")
-        try:
-            yield cur
-            cur.execute("COMMIT")
-        except Exception:
-            cur.execute("ROLLBACK")
-            raise
-        finally:
-            cur.close()
+        """Yield a cursor inside an atomic transaction (FR12).
+
+        Holds a per-Store lock for the duration of the tx so concurrent
+        threads on the same Store instance serialize cleanly instead of
+        racing on the sqlite3 connection's internal state.
+        """
+        with self._tx_lock:
+            cur = self._conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            try:
+                yield cur
+                cur.execute("COMMIT")
+            except Exception:
+                cur.execute("ROLLBACK")
+                raise
+            finally:
+                cur.close()
 
     def close(self) -> None:
         self._conn.close()
@@ -298,6 +315,20 @@ class Store:
           - UPDATE human_notes.consumed_at for any consumed notes
 
         Returns (iteration_id, candidate_id).
+
+        Idempotency contract: callers MUST `lookup_idempotency(task_id, key)`
+        first and skip this call if a record already exists. This method
+        treats `idempotency_key` as fresh; if the key already exists the
+        PRIMARY KEY constraint raises sqlite3.IntegrityError and the entire
+        transaction (candidate, iteration, scores, note consumption) rolls
+        back. That preserves correctness but the orchestrator should never
+        rely on it.
+
+        Note on orphan blobs: the content blob is written to disk BEFORE the
+        DB transaction starts. A rollback leaves an orphan file at
+        content/<article_id>/<candidate_id>.md. These are recoverable via a
+        GC sweep against the iteration_records / article_versions /
+        rejected_candidates tables; not implemented in v1.
         """
         consume_note_ids = consume_note_ids or []
         iteration_id = _new_id("iter")
@@ -371,13 +402,15 @@ class Store:
             for ro in reviewer_outputs:
                 cur.execute(
                     "INSERT INTO reviewer_scores "
-                    "(iteration_id, reviewer_id, rubric_scores_json, rubric_aggregate, "
-                    " pairwise_pref, pairwise_rationale, rubric_prompt_hash, "
-                    " pairwise_prompt_hash, reviewer_model) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "(iteration_id, reviewer_id, weight, rubric_scores_json, "
+                    " rubric_aggregate, pairwise_pref, pairwise_rationale, "
+                    " rubric_prompt_hash, pairwise_prompt_hash, "
+                    " rubric_model, pairwise_model) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         iteration_id,
                         ro.reviewer_id,
+                        ro.weight,
                         json.dumps(ro.rubric.scores),
                         ro.rubric.aggregate,
                         ro.pairwise.pref.value,
@@ -385,6 +418,7 @@ class Store:
                         ro.rubric.prompt_hash,
                         ro.pairwise.prompt_hash,
                         ro.rubric.model,
+                        ro.pairwise.model,
                     ),
                 )
 
@@ -426,18 +460,18 @@ class Store:
             reviewer_outputs = [
                 ReviewerOutput(
                     reviewer_id=s["reviewer_id"],
-                    weight=0.0,  # weight not stored on iteration; lookup task_reviewers if needed
+                    weight=s["weight"],
                     rubric=RubricScores(
                         scores=json.loads(s["rubric_scores_json"]),
                         aggregate=s["rubric_aggregate"],
                         prompt_hash=s["rubric_prompt_hash"],
-                        model=s["reviewer_model"],
+                        model=s["rubric_model"],
                     ),
                     pairwise=Pairwise(
                         pref=PairwisePref(s["pairwise_pref"]),
                         rationale=s["pairwise_rationale"] or "",
                         prompt_hash=s["pairwise_prompt_hash"],
-                        model=s["reviewer_model"],
+                        model=s["pairwise_model"],
                     ),
                 )
                 for s in scores

@@ -101,13 +101,15 @@ CREATE INDEX IF NOT EXISTS idx_iter_task ON iteration_records(task_id);
 CREATE TABLE IF NOT EXISTS reviewer_scores (
     iteration_id          TEXT NOT NULL REFERENCES iteration_records(id),
     reviewer_id           TEXT NOT NULL,
+    weight                REAL NOT NULL,       -- snapshot of task_reviewers.weight at iter time
     rubric_scores_json    TEXT NOT NULL,
     rubric_aggregate      REAL NOT NULL,
     pairwise_pref         TEXT NOT NULL,       -- 'candidate' | 'incumbent' | 'tie'
     pairwise_rationale    TEXT,
     rubric_prompt_hash    TEXT NOT NULL,
     pairwise_prompt_hash  TEXT NOT NULL,
-    reviewer_model        TEXT NOT NULL,
+    rubric_model          TEXT NOT NULL,       -- model used for the rubric call
+    pairwise_model        TEXT NOT NULL,       -- model used for the pairwise call (may differ)
     PRIMARY KEY (iteration_id, reviewer_id)
 );
 

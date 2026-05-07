@@ -46,7 +46,13 @@ def store(tmp_path: Path) -> Store:
     s.close()
 
 
-def _make_review(reviewer_id: str, weight: float, pref: PairwisePref) -> ReviewerOutput:
+def _make_review(
+    reviewer_id: str,
+    weight: float,
+    pref: PairwisePref,
+    rubric_model: str = "m-rubric",
+    pairwise_model: str = "m-pairwise",
+) -> ReviewerOutput:
     return ReviewerOutput(
         reviewer_id=reviewer_id,
         weight=weight,
@@ -54,13 +60,13 @@ def _make_review(reviewer_id: str, weight: float, pref: PairwisePref) -> Reviewe
             scores={"clarity": 4.0, "trust": 3.5},
             aggregate=3.75,
             prompt_hash="rh",
-            model="m",
+            model=rubric_model,
         ),
         pairwise=Pairwise(
             pref=pref,
             rationale="ok",
             prompt_hash="ph",
-            model="m",
+            model=pairwise_model,
         ),
     )
 
@@ -435,3 +441,214 @@ def test_lineage_returned_in_iter_index_order(store: Store):
         )
     lineage = store.get_lineage(task_id)
     assert [r.iter_index for r in lineage] == [0, 1, 2]
+
+
+# ---- M4.1 hardening tests --------------------------------------------------
+
+
+def test_lineage_preserves_reviewer_weight(store: Store):
+    """Regression: get_lineage previously hardcoded weight=0.0."""
+    article_id, parent_id, task_id = _bootstrap_article_and_task(store)
+    store.record_iteration(
+        task_id=task_id,
+        article_id=article_id,
+        iter_index=0,
+        parent_version_id=parent_id,
+        decision=Decision.KEPT,
+        decision_reason="ok",
+        candidate_text="v",
+        edit_summary="",
+        editor_prompt_hash="",
+        editor_model="",
+        aggregate_score=4.0,
+        pref_delta=0.3,
+        pref_ci_low=0.1,
+        pref_ci_high=0.5,
+        reviewer_outputs=[
+            _make_review("investor", 0.4, PairwisePref.CANDIDATE),
+            _make_review("engineer", 0.3, PairwisePref.CANDIDATE),
+            _make_review("vp", 0.3, PairwisePref.TIE),
+        ],
+    )
+    lineage = store.get_lineage(task_id)
+    assert len(lineage) == 1
+    weights = {ro.reviewer_id: ro.weight for ro in lineage[0].reviewer_outputs}
+    assert weights == {"investor": 0.4, "engineer": 0.3, "vp": 0.3}
+
+
+def test_lineage_preserves_distinct_rubric_and_pairwise_models(store: Store):
+    """Regression: rubric_model and pairwise_model were collapsed into one column."""
+    article_id, parent_id, task_id = _bootstrap_article_and_task(store)
+    store.record_iteration(
+        task_id=task_id,
+        article_id=article_id,
+        iter_index=0,
+        parent_version_id=parent_id,
+        decision=Decision.KEPT,
+        decision_reason="ok",
+        candidate_text="v",
+        edit_summary="",
+        editor_prompt_hash="",
+        editor_model="",
+        aggregate_score=4.0,
+        pref_delta=0.3,
+        pref_ci_low=0.1,
+        pref_ci_high=0.5,
+        reviewer_outputs=[
+            _make_review(
+                "r1",
+                1.0,
+                PairwisePref.CANDIDATE,
+                rubric_model="claude-sonnet-4-6",
+                pairwise_model="gpt-5",
+            ),
+        ],
+    )
+    rec = store.get_lineage(task_id)[0]
+    ro = rec.reviewer_outputs[0]
+    assert ro.rubric.model == "claude-sonnet-4-6"
+    assert ro.pairwise.model == "gpt-5"
+
+
+def test_duplicate_idempotency_key_raises_and_rolls_back(store: Store):
+    """Contract: caller must lookup_idempotency first. If they don't and reuse a
+    key, the second record_iteration raises and rolls back the entire write —
+    no partial state visible.
+    """
+    article_id, parent_id, task_id = _bootstrap_article_and_task(store)
+    store.record_iteration(
+        task_id=task_id,
+        article_id=article_id,
+        iter_index=0,
+        parent_version_id=parent_id,
+        decision=Decision.KEPT,
+        decision_reason="ok",
+        candidate_text="v0",
+        edit_summary="",
+        editor_prompt_hash="",
+        editor_model="",
+        aggregate_score=3.0,
+        pref_delta=0.1,
+        pref_ci_low=0.05,
+        pref_ci_high=0.3,
+        reviewer_outputs=[_make_review("r1", 1.0, PairwisePref.CANDIDATE)],
+        idempotency_key="dup-key",
+    )
+    assert len(store.get_lineage(task_id)) == 1
+
+    # Second call with the same key must fail — and not leave a phantom iter_index=1 row.
+    with pytest.raises(Exception):
+        store.record_iteration(
+            task_id=task_id,
+            article_id=article_id,
+            iter_index=1,
+            parent_version_id=parent_id,
+            decision=Decision.KEPT,
+            decision_reason="ok",
+            candidate_text="v1",
+            edit_summary="",
+            editor_prompt_hash="",
+            editor_model="",
+            aggregate_score=4.0,
+            pref_delta=0.3,
+            pref_ci_low=0.1,
+            pref_ci_high=0.5,
+            reviewer_outputs=[_make_review("r1", 1.0, PairwisePref.CANDIDATE)],
+            idempotency_key="dup-key",
+        )
+    # Still only the original iteration; no leak.
+    lineage = store.get_lineage(task_id)
+    assert len(lineage) == 1
+    assert lineage[0].iter_index == 0
+
+
+def test_concurrent_writes_to_different_tasks_dont_interfere(tmp_path: Path):
+    """FR10: two tasks running concurrently must not corrupt each other.
+
+    Models the cross-process case (each tenant/process has its own Store
+    pointing at the same DB file). SQLite WAL + busy_timeout handles the
+    write serialization. Two threads each own a Store and write to a
+    distinct task; we verify each task's lineage is intact.
+    """
+    import threading
+
+    db_path = tmp_path / "g.db"
+    content_root = tmp_path / "c"
+
+    # Bootstrap shared schema + two articles + two tasks via a setup Store.
+    setup = Store(db_path=db_path, content_root=content_root)
+    art_a, ver_a = setup.create_article(slug="a", content="draft a")
+    art_b, ver_b = setup.create_article(slug="b", content="draft b")
+    task_a = setup.create_task(
+        TaskConfig(
+            article_id=art_a,
+            reviewers=[ReviewerSpec("r", 1.0)],
+            target_aggregate=4.0,
+            reviewer_floor=3.0,
+            loop_limit=10,
+        )
+    )
+    task_b = setup.create_task(
+        TaskConfig(
+            article_id=art_b,
+            reviewers=[ReviewerSpec("r", 1.0)],
+            target_aggregate=4.0,
+            reviewer_floor=3.0,
+            loop_limit=10,
+        )
+    )
+    setup.mark_task_running(task_a)
+    setup.mark_task_running(task_b)
+    setup.close()
+
+    N = 5
+    errors: list[Exception] = []
+
+    def writer(article_id: str, parent_id: str, task_id: str) -> None:
+        store = Store(db_path=db_path, content_root=content_root)
+        try:
+            for i in range(N):
+                store.record_iteration(
+                    task_id=task_id,
+                    article_id=article_id,
+                    iter_index=i,
+                    parent_version_id=parent_id,
+                    decision=Decision.REJECTED,
+                    decision_reason="no_pref_improvement",
+                    candidate_text=f"{task_id}-v{i}",
+                    edit_summary="",
+                    editor_prompt_hash="",
+                    editor_model="",
+                    aggregate_score=3.0,
+                    pref_delta=-0.1,
+                    pref_ci_low=-0.3,
+                    pref_ci_high=0.1,
+                    reviewer_outputs=[
+                        _make_review("r", 1.0, PairwisePref.INCUMBENT)
+                    ],
+                )
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+        finally:
+            store.close()
+
+    t1 = threading.Thread(target=writer, args=(art_a, ver_a, task_a))
+    t2 = threading.Thread(target=writer, args=(art_b, ver_b, task_b))
+    t1.start(); t2.start()
+    t1.join(); t2.join()
+    assert errors == [], f"writer threads failed: {errors}"
+
+    verifier = Store(db_path=db_path, content_root=content_root)
+    try:
+        a_lineage = verifier.get_lineage(task_a)
+        b_lineage = verifier.get_lineage(task_b)
+        assert [r.iter_index for r in a_lineage] == list(range(N))
+        assert [r.iter_index for r in b_lineage] == list(range(N))
+        for r in a_lineage:
+            rej = verifier.get_rejected(r.candidate_id)
+            assert verifier.content.read(rej["content_path"]).startswith(task_a)
+        for r in b_lineage:
+            rej = verifier.get_rejected(r.candidate_id)
+            assert verifier.content.read(rej["content_path"]).startswith(task_b)
+    finally:
+        verifier.close()
