@@ -48,7 +48,8 @@ Single tenant: one author or a small team sharing a service.
 - `target_aggregate` (e.g., 4.0)
 - `reviewer_floor` (safety net; set generously low, e.g., 3.0)
 - `loop_limit`
-- `guardrails`: free-text don'ts (may be empty)
+- `must_do`: free-text required behaviors (may be empty)
+- `must_not_do`: free-text prohibited behaviors (may be empty)
 
 **Loop**
 
@@ -82,13 +83,13 @@ while not (aggregate >= target_aggregate
 ## Functional requirements
 
 - **FR1** Articles, kept versions, and rejected candidates form an immutable parent-child DAG.
-- **FR2** A task identifies one article, reviewers and weights, `target_aggregate`, `reviewer_floor`, `loop_limit`, and free-text guardrails.
+- **FR2** A task identifies one article, reviewers and weights, `target_aggregate`, `reviewer_floor`, `loop_limit`, and free-text `must_do` and `must_not_do` guardrails.
 - **FR3** Each iteration: editor produces a candidate; each reviewer with weight > 0 is called twice — once for rubric scores on the candidate, once for pairwise preference vs. incumbent.
 - **FR4** Candidate is kept iff bootstrap CI lower bound of weighted `pref_delta` > 0; otherwise reverted with reason.
 - **FR5** Loop terminates when `aggregate >= target_aggregate` AND every reviewer's `rubric_score >= reviewer_floor`, or when `iter >= loop_limit`.
-- **FR6** Fact-checker runs once at end of loop on the final version regardless of termination reason; output is advisory and never blocks or reverts.
+- **FR6** Fact-checker runs exactly once at end of loop on the final version, regardless of termination reason (target reached, loop limit, or aborted); output is advisory and never blocks or reverts.
 - **FR7** Every iteration (kept or reverted) writes a lineage record: parent_id, candidate_id, edit summary, per-reviewer rubric scores, per-reviewer preferences, decision, reason, prompt hashes, model IDs.
-- **FR8** Free-text guardrails are passed verbatim into the editor prompt; not structurally enforced.
+- **FR8** Free-text `must_do` and `must_not_do` are passed verbatim into the editor prompt as two labeled sections; not structurally enforced.
 - **FR9** `iterate` is idempotent per `(task_id, idempotency_key)`.
 - **FR10** Multiple tasks run concurrently across different articles without state corruption.
 - **FR11** Reviewers with weight = 0 are not called and excluded from both gates.
@@ -116,7 +117,7 @@ while not (aggregate >= target_aggregate
 - **Pairwise preference (with bootstrap CI) replaces "weakest score improved by 0.5" as the keep/revert rule.** More robust than a noisy absolute-score delta. Costs one extra reviewer call per iteration.
 - **Aggregate target + per-reviewer floor.** Aggregate-only lets a high-weight reviewer get drowned out. Per-reviewer-only stalls on one stubborn reviewer. The floor is a generous safety net.
 - **Fact-checker is always advisory, runs once at end of loop.** Author keeps decision authority on factual issues. Tradeoff: factually wrong drafts can still be marked complete if the human ignores the report.
-- **Free-text guardrails only.** No built-in length or style enforcement in v1. Pairwise preference partially protects against length/style drift but not fully. Acceptable for v1; revisit if drift observed.
+- **Free-text guardrails only (`must_do` + `must_not_do`).** No built-in length or style enforcement in v1. Pairwise preference partially protects against length/style drift but not fully. Acceptable for v1; revisit if drift observed.
 - **No held-out judge in v1.** Anti-gaming relies on pairwise being more robust than absolute scores. Add later if needed.
 
 ## Out of scope (deferred to later versions)

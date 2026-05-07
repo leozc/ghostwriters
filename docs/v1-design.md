@@ -40,9 +40,10 @@ SQLite for relational data. Filesystem for content blobs at `data/articles/<arti
 ```python
 def propose(
     incumbent_text: str,
-    prior_reviews: list[ReviewerOutput],
-    guardrails_text: str,
-    human_notes: list[str],
+    prior_reviews: list[ReviewerOutput],   # last iteration only (see Context management)
+    must_do_text: str,
+    must_not_do_text: str,
+    human_notes: list[str],                # consumed-after-use
 ) -> Candidate
 ```
 Returns `Candidate(text, edit_summary, prompt_hash, model)`.
@@ -106,7 +107,8 @@ CREATE TABLE tasks (
     target_aggregate    REAL NOT NULL,
     reviewer_floor      REAL NOT NULL,
     loop_limit          INTEGER NOT NULL,
-    guardrails_text     TEXT NOT NULL DEFAULT '',
+    must_do_text        TEXT NOT NULL DEFAULT '',
+    must_not_do_text    TEXT NOT NULL DEFAULT '',
     status              TEXT NOT NULL,        -- 'pending' | 'running' | 'done' | 'aborted'
     final_version_id    TEXT REFERENCES article_versions(id),
     stop_reason         TEXT,                 -- 'target_reached' | 'loop_limit' | 'aborted'
@@ -188,7 +190,7 @@ CREATE TABLE idempotency_keys (
 | FR5   | Orchestrator stop check on `aggregate_score` and per-reviewer scores      |
 | FR6   | `fact_check_reports`; written once per task at end of loop                |
 | FR7   | `iteration_records` + `reviewer_scores` capture full per-iter context     |
-| FR8   | `tasks.guardrails_text` passed verbatim to editor adapter                |
+| FR8   | `tasks.must_do_text` and `tasks.must_not_do_text` passed verbatim to editor as labeled sections |
 | FR9   | `idempotency_keys` table; orchestrator checks before scheduling iter     |
 | FR10  | Per-task asyncio lock; SQLite WAL; no shared mutable state across tasks  |
 | FR11  | Orchestrator filters `task_reviewers.weight > 0` before adapter calls    |
@@ -238,7 +240,8 @@ All POST endpoints accept `Idempotency-Key`; only `iterate` semantically require
   "target_aggregate": 4.0,
   "reviewer_floor":   3.0,
   "loop_limit":       12,
-  "guardrails_text":  "no hype; plain language; no analogies to cars"
+  "must_do_text":     "include a concrete launch date; cite the source for every metric",
+  "must_not_do_text": "no hype; no analogies to cars; no headers longer than 8 words"
 }
 ```
 
@@ -341,6 +344,31 @@ Existing top-level files (`personas/`, `goal.md`, `writer.md`, etc.) stay where 
 5. **Fact-checker integration** — wire end-of-loop call.
 6. **API + CLI** — FastAPI routes + CLI client.
 7. **Acceptance tests** — A1–A6 from the requirements doc.
+
+## Context management
+
+Each adapter call has a strict context budget to prevent prompt bloat as iterations accumulate.
+
+**Editor prompt** sees, per iteration:
+
+| Section                              | Size            | Bounded?                          |
+|--------------------------------------|-----------------|-----------------------------------|
+| Goal                                 | hundreds tok.   | static                            |
+| `must_do_text`                       | small           | static                            |
+| `must_not_do_text`                   | small           | static                            |
+| Current incumbent text               | thousands tok.  | bounded by article size           |
+| **Last iteration's reviewer feedback** | varies        | bounded — only most recent iter   |
+| Pending human notes                  | small           | consumed-after-use                |
+
+**Key rule:** the editor only receives the *most recent* iteration's reviewer feedback. Older iterations are queryable in the lineage store for human inspection but never re-injected. This caps editor prompt size at `O(article + reviewers)` regardless of `loop_limit`.
+
+**Pending human notes** are consumed atomically: when an iteration includes a note, the orchestrator marks `human_notes.consumed_at = NOW()` in the same transaction that writes the iteration record. They never re-appear in subsequent prompts.
+
+**Reviewer prompts** see only the candidate text, the reviewer's persona, the rubric definition, and (for the pairwise call) the incumbent. No iteration history, no other reviewers' personas or scores, no cross-reviewer contamination.
+
+**Fact-checker prompt** sees only the final version text and (optionally) a curated source list. No iteration history.
+
+This isolation has a cost: the editor doesn't see *why* prior candidates were rejected beyond the most recent reviewer feedback. If that turns out to matter, v2 can add a compressed history channel — but we ship v1 without it and observe whether convergence suffers.
 
 ## Open questions for the next milestone
 
