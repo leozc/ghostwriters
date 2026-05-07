@@ -1,0 +1,437 @@
+"""Tests for ghostwriter.store.sqlite — the lineage store (M4).
+
+Covers:
+  - Schema bootstrap (idempotent)
+  - Article and task creation
+  - Atomic iteration writes (kept and rejected paths)
+  - Idempotency lookup (FR9)
+  - Human-note consume-after-use (FR15-style)
+  - Resume state for crash recovery (FR12)
+  - Fact-check save and retrieval (FR6)
+  - Lineage read in iter_index order (FR13)
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pytest
+
+from ghostwriter.store.sqlite import Store
+from ghostwriter.types import (
+    ClaimVerdict,
+    Decision,
+    FactCheckClaim,
+    FactCheckReport,
+    FactCheckStatus,
+    Pairwise,
+    PairwisePref,
+    ReviewerOutput,
+    ReviewerSpec,
+    RubricScores,
+    StopReason,
+    TaskConfig,
+    TaskStatus,
+)
+
+
+# ---- helpers --------------------------------------------------------------
+
+
+@pytest.fixture
+def store(tmp_path: Path) -> Store:
+    s = Store(db_path=tmp_path / "ghostwriter.db", content_root=tmp_path / "content")
+    yield s
+    s.close()
+
+
+def _make_review(reviewer_id: str, weight: float, pref: PairwisePref) -> ReviewerOutput:
+    return ReviewerOutput(
+        reviewer_id=reviewer_id,
+        weight=weight,
+        rubric=RubricScores(
+            scores={"clarity": 4.0, "trust": 3.5},
+            aggregate=3.75,
+            prompt_hash="rh",
+            model="m",
+        ),
+        pairwise=Pairwise(
+            pref=pref,
+            rationale="ok",
+            prompt_hash="ph",
+            model="m",
+        ),
+    )
+
+
+def _bootstrap_article_and_task(store: Store) -> tuple[str, str, str]:
+    article_id, version_id = store.create_article(slug="launch", content="initial draft")
+    task_id = store.create_task(
+        TaskConfig(
+            article_id=article_id,
+            reviewers=[
+                ReviewerSpec("investor", 0.4),
+                ReviewerSpec("engineer", 0.3),
+                ReviewerSpec("vp", 0.3),
+                ReviewerSpec("legal", 0.0),  # excluded by weight (FR11)
+            ],
+            target_aggregate=4.0,
+            reviewer_floor=3.0,
+            loop_limit=5,
+            must_do_text="cite sources",
+            must_not_do_text="no hype",
+        )
+    )
+    store.mark_task_running(task_id)
+    return article_id, version_id, task_id
+
+
+# ---- schema and basic CRUD ------------------------------------------------
+
+
+def test_schema_init_is_idempotent(tmp_path: Path):
+    db = tmp_path / "g.db"
+    s1 = Store(db_path=db, content_root=tmp_path / "c1")
+    s1.close()
+    # Re-open should not raise; CREATE TABLE IF NOT EXISTS is idempotent.
+    s2 = Store(db_path=db, content_root=tmp_path / "c2")
+    s2.close()
+
+
+def test_create_and_get_article(store: Store):
+    article_id, version_id = store.create_article(slug="my-post", content="hello world")
+    art = store.get_article(article_id)
+    assert art is not None and art["slug"] == "my-post"
+    ver = store.get_version(version_id)
+    assert ver is not None and ver["article_id"] == article_id
+    assert store.content.read(ver["content_path"]) == "hello world"
+
+
+def test_create_task_persists_reviewers_and_guardrails(store: Store):
+    article_id, _ = store.create_article(slug="x", content="x")
+    task_id = store.create_task(
+        TaskConfig(
+            article_id=article_id,
+            reviewers=[ReviewerSpec("a", 0.6), ReviewerSpec("b", 0.4)],
+            target_aggregate=4.0,
+            reviewer_floor=3.0,
+            loop_limit=10,
+            must_do_text="MUST",
+            must_not_do_text="DONT",
+        )
+    )
+    task = store.get_task(task_id)
+    assert task is not None
+    assert task["must_do_text"] == "MUST"
+    assert task["must_not_do_text"] == "DONT"
+    reviewer_ids = sorted(r["reviewer_id"] for r in task["reviewers"])
+    assert reviewer_ids == ["a", "b"]
+    assert task["status"] == TaskStatus.PENDING.value
+
+
+# ---- iteration writes -----------------------------------------------------
+
+
+def test_record_iteration_kept_writes_version_and_scores(store: Store):
+    article_id, parent_id, task_id = _bootstrap_article_and_task(store)
+
+    iteration_id, candidate_id = store.record_iteration(
+        task_id=task_id,
+        article_id=article_id,
+        iter_index=0,
+        parent_version_id=parent_id,
+        decision=Decision.KEPT,
+        decision_reason="pref_ci_low > 0",
+        candidate_text="improved draft",
+        edit_summary="tightened intro",
+        editor_prompt_hash="eh",
+        editor_model="claude-sonnet",
+        aggregate_score=3.9,
+        pref_delta=0.4,
+        pref_ci_low=0.1,
+        pref_ci_high=0.7,
+        reviewer_outputs=[
+            _make_review("investor", 0.4, PairwisePref.CANDIDATE),
+            _make_review("engineer", 0.3, PairwisePref.CANDIDATE),
+            _make_review("vp", 0.3, PairwisePref.TIE),
+        ],
+    )
+    # Version row exists and points at the right parent.
+    ver = store.get_version(candidate_id)
+    assert ver is not None
+    assert ver["parent_version_id"] == parent_id
+    assert store.content.read(ver["content_path"]) == "improved draft"
+
+    # Iteration record + reviewer_scores are queryable via lineage.
+    lineage = store.get_lineage(task_id)
+    assert len(lineage) == 1
+    rec = lineage[0]
+    assert rec.id == iteration_id
+    assert rec.decision is Decision.KEPT
+    assert rec.candidate_id == candidate_id
+    assert {ro.reviewer_id for ro in rec.reviewer_outputs} == {"investor", "engineer", "vp"}
+
+
+def test_record_iteration_rejected_writes_to_rejected_table(store: Store):
+    article_id, parent_id, task_id = _bootstrap_article_and_task(store)
+
+    _, candidate_id = store.record_iteration(
+        task_id=task_id,
+        article_id=article_id,
+        iter_index=0,
+        parent_version_id=parent_id,
+        decision=Decision.REJECTED,
+        decision_reason="no_pref_improvement",
+        candidate_text="worse draft",
+        edit_summary="restructured",
+        editor_prompt_hash="eh",
+        editor_model="claude-sonnet",
+        aggregate_score=3.2,
+        pref_delta=-0.1,
+        pref_ci_low=-0.4,
+        pref_ci_high=0.2,
+        reviewer_outputs=[_make_review("investor", 0.4, PairwisePref.INCUMBENT)],
+    )
+    # Should NOT create an article_versions row.
+    assert store.get_version(candidate_id) is None
+    rej = store.get_rejected(candidate_id)
+    assert rej is not None
+    assert rej["rejection_reason"] == "no_pref_improvement"
+
+    lineage = store.get_lineage(task_id)
+    assert lineage[0].decision is Decision.REJECTED
+    assert lineage[0].decision_reason == "no_pref_improvement"
+
+
+def test_iteration_rollback_on_failure(store: Store):
+    """If the iteration tx fails partway, no rows or DB state should leak.
+
+    We trigger failure by violating the (task_id, iter_index) UNIQUE constraint:
+    the second record_iteration with the same iter_index must roll back
+    everything and leave only the first iteration's rows in place.
+    """
+    article_id, parent_id, task_id = _bootstrap_article_and_task(store)
+
+    # First iter at index 0 — succeeds.
+    store.record_iteration(
+        task_id=task_id,
+        article_id=article_id,
+        iter_index=0,
+        parent_version_id=parent_id,
+        decision=Decision.KEPT,
+        decision_reason="ok",
+        candidate_text="v1",
+        edit_summary="",
+        editor_prompt_hash="",
+        editor_model="",
+        aggregate_score=3.5,
+        pref_delta=0.2,
+        pref_ci_low=0.05,
+        pref_ci_high=0.4,
+        reviewer_outputs=[_make_review("r1", 1.0, PairwisePref.CANDIDATE)],
+    )
+    assert len(store.get_lineage(task_id)) == 1
+
+    # Second iter also at index 0 — must fail and roll back, not leave a partial row.
+    with pytest.raises(Exception):
+        store.record_iteration(
+            task_id=task_id,
+            article_id=article_id,
+            iter_index=0,
+            parent_version_id=parent_id,
+            decision=Decision.KEPT,
+            decision_reason="dup",
+            candidate_text="v2",
+            edit_summary="",
+            editor_prompt_hash="",
+            editor_model="",
+            aggregate_score=4.0,
+            pref_delta=0.3,
+            pref_ci_low=0.1,
+            pref_ci_high=0.5,
+            reviewer_outputs=[_make_review("r1", 1.0, PairwisePref.CANDIDATE)],
+        )
+    # Still exactly one iteration record; the failed write rolled back fully.
+    lineage = store.get_lineage(task_id)
+    assert len(lineage) == 1
+    assert lineage[0].aggregate_score == 3.5
+
+
+# ---- idempotency (FR9) ----------------------------------------------------
+
+
+def test_idempotency_lookup_returns_iteration_id(store: Store):
+    article_id, parent_id, task_id = _bootstrap_article_and_task(store)
+    iteration_id, _ = store.record_iteration(
+        task_id=task_id,
+        article_id=article_id,
+        iter_index=0,
+        parent_version_id=parent_id,
+        decision=Decision.KEPT,
+        decision_reason="ok",
+        candidate_text="v",
+        edit_summary="",
+        editor_prompt_hash="",
+        editor_model="",
+        aggregate_score=4.0,
+        pref_delta=0.3,
+        pref_ci_low=0.1,
+        pref_ci_high=0.5,
+        reviewer_outputs=[_make_review("r1", 1.0, PairwisePref.CANDIDATE)],
+        idempotency_key="abc-123",
+    )
+    found = store.lookup_idempotency(task_id, "abc-123")
+    assert found == iteration_id
+    assert store.lookup_idempotency(task_id, "other") is None
+
+
+# ---- human notes ----------------------------------------------------------
+
+
+def test_human_note_consumed_after_use_atomically(store: Store):
+    article_id, parent_id, task_id = _bootstrap_article_and_task(store)
+    note_id = store.add_human_note(task_id, "use the new metric")
+    pending = store.pending_notes(task_id)
+    assert len(pending) == 1 and pending[0]["id"] == note_id
+
+    store.record_iteration(
+        task_id=task_id,
+        article_id=article_id,
+        iter_index=0,
+        parent_version_id=parent_id,
+        decision=Decision.KEPT,
+        decision_reason="ok",
+        candidate_text="v",
+        edit_summary="",
+        editor_prompt_hash="",
+        editor_model="",
+        aggregate_score=4.0,
+        pref_delta=0.3,
+        pref_ci_low=0.1,
+        pref_ci_high=0.5,
+        reviewer_outputs=[_make_review("r1", 1.0, PairwisePref.CANDIDATE)],
+        consume_note_ids=[note_id],
+    )
+    assert store.pending_notes(task_id) == []
+
+
+# ---- resume / crash recovery (FR12) ---------------------------------------
+
+
+def test_resume_state_lists_running_tasks(store: Store):
+    article_id, parent_id, task_id = _bootstrap_article_and_task(store)
+    # Task is running; one iteration written.
+    store.record_iteration(
+        task_id=task_id,
+        article_id=article_id,
+        iter_index=0,
+        parent_version_id=parent_id,
+        decision=Decision.KEPT,
+        decision_reason="ok",
+        candidate_text="v",
+        edit_summary="",
+        editor_prompt_hash="",
+        editor_model="",
+        aggregate_score=3.0,
+        pref_delta=0.1,
+        pref_ci_low=0.01,
+        pref_ci_high=0.3,
+        reviewer_outputs=[_make_review("r1", 1.0, PairwisePref.CANDIDATE)],
+    )
+    state = store.resume_state()
+    assert state == [(task_id, 0)]
+
+    # After completion, task should not appear in resume_state.
+    store.mark_task_terminal(
+        task_id=task_id,
+        status=TaskStatus.DONE,
+        stop_reason=StopReason.TARGET_REACHED,
+        final_version_id=None,
+    )
+    assert store.resume_state() == []
+
+
+def test_resume_picks_correct_max_iter_index(store: Store):
+    article_id, parent_id, task_id = _bootstrap_article_and_task(store)
+    for i in range(3):
+        store.record_iteration(
+            task_id=task_id,
+            article_id=article_id,
+            iter_index=i,
+            parent_version_id=parent_id,
+            decision=Decision.REJECTED,
+            decision_reason="no_pref_improvement",
+            candidate_text=f"v{i}",
+            edit_summary="",
+            editor_prompt_hash="",
+            editor_model="",
+            aggregate_score=3.0,
+            pref_delta=-0.1,
+            pref_ci_low=-0.3,
+            pref_ci_high=0.1,
+            reviewer_outputs=[_make_review("r1", 1.0, PairwisePref.INCUMBENT)],
+        )
+    state = store.resume_state()
+    assert state == [(task_id, 2)]
+
+
+# ---- fact-check (FR6) -----------------------------------------------------
+
+
+def test_save_and_get_fact_check_report(store: Store):
+    article_id, version_id, task_id = _bootstrap_article_and_task(store)
+    report = FactCheckReport(
+        status=FactCheckStatus.HAS_FINDINGS,
+        claims=[
+            FactCheckClaim(
+                text="X grew 50% in 2024",
+                verdict=ClaimVerdict.UNVERIFIED,
+                sources=[],
+                rationale="no source found",
+            ),
+            FactCheckClaim(
+                text="Y is a public company",
+                verdict=ClaimVerdict.VERIFIED,
+                sources=["https://example.com/sec"],
+                rationale="confirmed via SEC filing",
+            ),
+        ],
+        prompt_hash="fh",
+        model="gpt-5",
+    )
+    store.save_fact_check(task_id=task_id, final_version_id=version_id, report=report)
+    got = store.get_fact_check(task_id)
+    assert got is not None
+    assert got.status is FactCheckStatus.HAS_FINDINGS
+    assert len(got.claims) == 2
+    verdicts = {c.verdict for c in got.claims}
+    assert verdicts == {ClaimVerdict.UNVERIFIED, ClaimVerdict.VERIFIED}
+
+
+# ---- lineage read order (FR13) -------------------------------------------
+
+
+def test_lineage_returned_in_iter_index_order(store: Store):
+    article_id, parent_id, task_id = _bootstrap_article_and_task(store)
+    # Insert out of order to make sure ordering comes from iter_index, not insert time.
+    for i in [2, 0, 1]:
+        store.record_iteration(
+            task_id=task_id,
+            article_id=article_id,
+            iter_index=i,
+            parent_version_id=parent_id,
+            decision=Decision.REJECTED,
+            decision_reason="no_pref_improvement",
+            candidate_text=f"v{i}",
+            edit_summary="",
+            editor_prompt_hash="",
+            editor_model="",
+            aggregate_score=float(i),
+            pref_delta=0.0,
+            pref_ci_low=-0.1,
+            pref_ci_high=0.1,
+            reviewer_outputs=[_make_review("r1", 1.0, PairwisePref.TIE)],
+        )
+    lineage = store.get_lineage(task_id)
+    assert [r.iter_index for r in lineage] == [0, 1, 2]
