@@ -17,9 +17,12 @@
 --   FR8  : tasks.must_do_text + tasks.must_not_do_text
 --   FR9  : idempotency_keys
 --   FR12 : single transaction per iteration
-
-PRAGMA foreign_keys = ON;
-PRAGMA journal_mode = WAL;
+--
+-- NOTE: PRAGMAs are connection-scoped and so are set in Store.__init__,
+-- not here. executescript() runs against the connection but the PRAGMAs
+-- below would only apply during the bootstrap script's lifetime, not for
+-- subsequent queries. Keeping this comment so future readers don't add
+-- them back into the SQL by mistake.
 
 CREATE TABLE IF NOT EXISTS articles (
     id          TEXT PRIMARY KEY,

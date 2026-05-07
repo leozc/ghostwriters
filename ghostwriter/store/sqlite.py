@@ -109,17 +109,27 @@ class Store:
         Holds a per-Store lock for the duration of the tx so concurrent
         threads on the same Store instance serialize cleanly instead of
         racing on the sqlite3 connection's internal state.
+
+        If the body raises, ROLLBACK runs and the body's exception
+        propagates. If COMMIT itself raises, we still attempt ROLLBACK
+        but swallow any error from it so the original COMMIT exception
+        is what surfaces — never masked by a "no transaction in progress"
+        secondary failure.
         """
         with self._tx_lock:
             cur = self._conn.cursor()
             cur.execute("BEGIN IMMEDIATE")
+            committed = False
             try:
                 yield cur
                 cur.execute("COMMIT")
-            except Exception:
-                cur.execute("ROLLBACK")
-                raise
+                committed = True
             finally:
+                if not committed:
+                    try:
+                        cur.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
                 cur.close()
 
     def close(self) -> None:
@@ -316,25 +326,39 @@ class Store:
 
         Returns (iteration_id, candidate_id).
 
-        Idempotency contract: callers MUST `lookup_idempotency(task_id, key)`
-        first and skip this call if a record already exists. This method
-        treats `idempotency_key` as fresh; if the key already exists the
-        PRIMARY KEY constraint raises sqlite3.IntegrityError and the entire
-        transaction (candidate, iteration, scores, note consumption) rolls
-        back. That preserves correctness but the orchestrator should never
-        rely on it.
+        FR9 idempotency: this method is self-idempotent. If `idempotency_key`
+        is provided and already maps to an iteration for this task, the
+        existing (iteration_id, candidate_id) is returned and no new write
+        happens. A concurrent racer past the fast-path lookup will hit the
+        PRIMARY KEY on idempotency_keys inside the transaction and the
+        whole tx rolls back — leaving a blob orphan but no DB inconsistency.
+        Callers may retry safely with the same key.
 
         Note on orphan blobs: the content blob is written to disk BEFORE the
-        DB transaction starts. A rollback leaves an orphan file at
+        DB transaction starts. A rollback (or a second concurrent caller
+        with the same key) leaves an orphan file at
         content/<article_id>/<candidate_id>.md. These are recoverable via a
-        GC sweep against the iteration_records / article_versions /
-        rejected_candidates tables; not implemented in v1.
+        GC sweep against iteration_records / article_versions /
+        rejected_candidates; not implemented in v1.
         """
         consume_note_ids = consume_note_ids or []
-        iteration_id = _new_id("iter")
 
-        # Write content blob outside the DB transaction. If the DB tx fails,
-        # we leak a blob file but never have a DB row pointing at missing content.
+        # FR9 fast path: if this idempotency key already mapped to an
+        # iteration, return what was recorded then. No blob write, no tx.
+        if idempotency_key is not None:
+            existing_iter = self.lookup_idempotency(task_id, idempotency_key)
+            if existing_iter is not None:
+                row = self._conn.execute(
+                    "SELECT candidate_id FROM iteration_records WHERE id = ?",
+                    (existing_iter,),
+                ).fetchone()
+                if row is not None:
+                    return existing_iter, row["candidate_id"]
+
+        iteration_id = _new_id("iter")
+        # Write content blob outside the DB transaction. If the DB tx fails
+        # (e.g. concurrent racer claimed the same idempotency key), the blob
+        # is orphaned; no DB row will point at missing content.
         if decision is Decision.KEPT:
             candidate_id = _new_id("ver")
         else:
@@ -431,9 +455,15 @@ class Store:
 
             for note_id in consume_note_ids:
                 cur.execute(
-                    "UPDATE human_notes SET consumed_at = ? WHERE id = ? AND task_id = ?",
+                    "UPDATE human_notes SET consumed_at = ? "
+                    "WHERE id = ? AND task_id = ? AND consumed_at IS NULL",
                     (_now(), note_id, task_id),
                 )
+                if cur.rowcount == 0:
+                    raise ValueError(
+                        f"human note {note_id} already consumed or not "
+                        f"found for task {task_id}"
+                    )
 
         return iteration_id, candidate_id
 
@@ -442,64 +472,87 @@ class Store:
     def get_lineage(self, task_id: str) -> list[IterationRecord]:
         """Returns all iterations for a task in iter_index order.
 
-        Each record carries its full reviewer_outputs payload reconstructed
-        from reviewer_scores rows.
+        Single LEFT JOIN: rows are grouped by iteration_id in Python,
+        avoiding the N+1 query pattern. An iteration with no reviewer
+        rows still appears (rs_* columns will be NULL).
         """
         cur = self._conn.cursor()
-        iters = cur.execute(
-            "SELECT * FROM iteration_records WHERE task_id = ? "
-            "ORDER BY iter_index ASC",
+        rows = cur.execute(
+            "SELECT ir.id, ir.task_id, ir.iter_index, ir.parent_version_id, "
+            "       ir.candidate_id, ir.decision, ir.decision_reason, "
+            "       ir.aggregate_score, ir.pref_delta, ir.pref_ci_low, "
+            "       ir.pref_ci_high, ir.created_at, "
+            "       rs.reviewer_id, rs.weight, rs.rubric_scores_json, "
+            "       rs.rubric_aggregate, rs.pairwise_pref, rs.pairwise_rationale, "
+            "       rs.rubric_prompt_hash, rs.pairwise_prompt_hash, "
+            "       rs.rubric_model, rs.pairwise_model "
+            "FROM iteration_records ir "
+            "LEFT JOIN reviewer_scores rs ON rs.iteration_id = ir.id "
+            "WHERE ir.task_id = ? "
+            "ORDER BY ir.iter_index ASC, rs.reviewer_id ASC",
             (task_id,),
         ).fetchall()
-        result: list[IterationRecord] = []
-        for it in iters:
-            scores = cur.execute(
-                "SELECT * FROM reviewer_scores WHERE iteration_id = ?",
-                (it["id"],),
-            ).fetchall()
-            reviewer_outputs = [
-                ReviewerOutput(
-                    reviewer_id=s["reviewer_id"],
-                    weight=s["weight"],
-                    rubric=RubricScores(
-                        scores=json.loads(s["rubric_scores_json"]),
-                        aggregate=s["rubric_aggregate"],
-                        prompt_hash=s["rubric_prompt_hash"],
-                        model=s["rubric_model"],
-                    ),
-                    pairwise=Pairwise(
-                        pref=PairwisePref(s["pairwise_pref"]),
-                        rationale=s["pairwise_rationale"] or "",
-                        prompt_hash=s["pairwise_prompt_hash"],
-                        model=s["pairwise_model"],
-                    ),
+
+        meta_by_id: dict[str, sqlite3.Row] = {}
+        reviewers_by_id: dict[str, list[ReviewerOutput]] = {}
+        order: list[str] = []
+
+        for row in rows:
+            iter_id = row["id"]
+            if iter_id not in meta_by_id:
+                order.append(iter_id)
+                meta_by_id[iter_id] = row
+                reviewers_by_id[iter_id] = []
+            if row["reviewer_id"] is not None:
+                reviewers_by_id[iter_id].append(
+                    ReviewerOutput(
+                        reviewer_id=row["reviewer_id"],
+                        weight=row["weight"],
+                        rubric=RubricScores(
+                            scores=json.loads(row["rubric_scores_json"]),
+                            aggregate=row["rubric_aggregate"],
+                            prompt_hash=row["rubric_prompt_hash"],
+                            model=row["rubric_model"],
+                        ),
+                        pairwise=Pairwise(
+                            pref=PairwisePref(row["pairwise_pref"]),
+                            rationale=row["pairwise_rationale"] or "",
+                            prompt_hash=row["pairwise_prompt_hash"],
+                            model=row["pairwise_model"],
+                        ),
+                    )
                 )
-                for s in scores
-            ]
-            result.append(
-                IterationRecord(
-                    id=it["id"],
-                    task_id=it["task_id"],
-                    iter_index=it["iter_index"],
-                    parent_version_id=it["parent_version_id"],
-                    candidate_id=it["candidate_id"],
-                    decision=Decision(it["decision"]),
-                    decision_reason=it["decision_reason"],
-                    aggregate_score=it["aggregate_score"],
-                    pref_delta=it["pref_delta"],
-                    pref_ci_low=it["pref_ci_low"],
-                    pref_ci_high=it["pref_ci_high"],
-                    reviewer_outputs=reviewer_outputs,
-                    created_at=datetime.fromisoformat(it["created_at"]),
-                )
+
+        return [
+            IterationRecord(
+                id=meta_by_id[i]["id"],
+                task_id=meta_by_id[i]["task_id"],
+                iter_index=meta_by_id[i]["iter_index"],
+                parent_version_id=meta_by_id[i]["parent_version_id"],
+                candidate_id=meta_by_id[i]["candidate_id"],
+                decision=Decision(meta_by_id[i]["decision"]),
+                decision_reason=meta_by_id[i]["decision_reason"],
+                aggregate_score=meta_by_id[i]["aggregate_score"],
+                pref_delta=meta_by_id[i]["pref_delta"],
+                pref_ci_low=meta_by_id[i]["pref_ci_low"],
+                pref_ci_high=meta_by_id[i]["pref_ci_high"],
+                reviewer_outputs=reviewers_by_id[i],
+                created_at=datetime.fromisoformat(meta_by_id[i]["created_at"]),
             )
-        return result
+            for i in order
+        ]
 
     # ---- fact-check (FR6) -------------------------------------------------
 
     def save_fact_check(
         self, *, task_id: str, final_version_id: str, report: FactCheckReport
     ) -> str:
+        """Save the end-of-loop fact-check report (FR6).
+
+        Idempotent: a second call for the same task_id returns the existing
+        report_id without overwriting. The orchestrator's retry path (e.g.
+        after a crash between fact-check and response) is therefore safe.
+        """
         report_id = _new_id("fcr")
         payload = {
             "claims": [
@@ -514,7 +567,7 @@ class Store:
         }
         with self.transaction() as cur:
             cur.execute(
-                "INSERT INTO fact_check_reports "
+                "INSERT OR IGNORE INTO fact_check_reports "
                 "(id, task_id, final_version_id, status, report_json, "
                 " fact_checker_model, fact_checker_prompt_hash, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -529,6 +582,12 @@ class Store:
                     _now(),
                 ),
             )
+            if cur.rowcount == 0:
+                existing = cur.execute(
+                    "SELECT id FROM fact_check_reports WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()
+                return existing["id"]
         return report_id
 
     def get_fact_check(self, task_id: str) -> Optional[FactCheckReport]:

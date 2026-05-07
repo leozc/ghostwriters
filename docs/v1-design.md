@@ -218,7 +218,7 @@ POST   /tasks/{id}/iterate                run iterations until stop or N reached
                                           body: {max_iterations?: int}
 
 POST   /tasks/{id}/note                   inject human note for next iteration
-                                          body: {text} (FR15-style; consumed by orch)
+                                          body: {text}; orchestrator consumes one-shot
 
 POST   /tasks/{id}/abort                  stop the task; sets status='aborted'
 
@@ -250,6 +250,16 @@ All POST endpoints accept `Idempotency-Key`; only `iterate` semantically require
 - **Per-task lock**: asyncio lock keyed by `task_id`. Held for the duration of a single iteration. Concurrent `iterate` calls on the same task with different idempotency keys queue; with the same key, the second call returns the result of the first.
 - **Cross-task**: independent. SQLite WAL allows concurrent readers; writes serialize automatically. Target N=10 concurrent tasks on distinct articles.
 - **No shared mutable state** between tasks beyond the SQLite handle and provider clients.
+
+### Sync Store + asyncio orchestrator (v1 decision)
+
+`Store` is synchronous (`sqlite3` stdlib). The orchestrator is asyncio. For v1, we accept that DB calls block the event loop briefly: iteration writes are milliseconds while LLM calls dominate per-iteration cost (seconds). At the FR10 target of N=10 concurrent tasks, the threading lock around `Store.transaction()` is not a meaningful bottleneck.
+
+If usage moves past ~10 concurrent tasks, two options:
+1. Migrate to `aiosqlite` (async driver, methods become `async def`).
+2. Wrap Store calls in `loop.run_in_executor(None, ...)` from the orchestrator without changing the Store API.
+
+Either is a bounded refactor. We don't pre-pay for it in v1.
 
 ## Crash recovery (FR12)
 

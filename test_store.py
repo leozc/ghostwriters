@@ -510,13 +510,13 @@ def test_lineage_preserves_distinct_rubric_and_pairwise_models(store: Store):
     assert ro.pairwise.model == "gpt-5"
 
 
-def test_duplicate_idempotency_key_raises_and_rolls_back(store: Store):
-    """Contract: caller must lookup_idempotency first. If they don't and reuse a
-    key, the second record_iteration raises and rolls back the entire write —
-    no partial state visible.
+def test_record_iteration_is_idempotent_on_retry(store: Store):
+    """FR9: re-calling record_iteration with the same idempotency_key
+    returns the original (iteration_id, candidate_id) without writing a
+    second record. Models the orchestrator-crash-then-retry path.
     """
     article_id, parent_id, task_id = _bootstrap_article_and_task(store)
-    store.record_iteration(
+    iter1, cand1 = store.record_iteration(
         task_id=task_id,
         article_id=article_id,
         iter_index=0,
@@ -532,12 +532,97 @@ def test_duplicate_idempotency_key_raises_and_rolls_back(store: Store):
         pref_ci_low=0.05,
         pref_ci_high=0.3,
         reviewer_outputs=[_make_review("r1", 1.0, PairwisePref.CANDIDATE)],
-        idempotency_key="dup-key",
+        idempotency_key="retry-key",
     )
     assert len(store.get_lineage(task_id)) == 1
 
-    # Second call with the same key must fail — and not leave a phantom iter_index=1 row.
-    with pytest.raises(Exception):
+    # Retry with the same key — note differing iter_index and content — must
+    # return the original IDs and NOT create a second iteration.
+    iter2, cand2 = store.record_iteration(
+        task_id=task_id,
+        article_id=article_id,
+        iter_index=99,            # would-be different
+        parent_version_id=parent_id,
+        decision=Decision.REJECTED,  # would-be different
+        decision_reason="anything",
+        candidate_text="totally different",
+        edit_summary="",
+        editor_prompt_hash="",
+        editor_model="",
+        aggregate_score=4.0,
+        pref_delta=0.3,
+        pref_ci_low=0.1,
+        pref_ci_high=0.5,
+        reviewer_outputs=[_make_review("r1", 1.0, PairwisePref.CANDIDATE)],
+        idempotency_key="retry-key",
+    )
+    assert iter2 == iter1
+    assert cand2 == cand1
+    lineage = store.get_lineage(task_id)
+    assert len(lineage) == 1
+    assert lineage[0].iter_index == 0
+    assert lineage[0].decision is Decision.KEPT
+
+
+def test_save_fact_check_is_idempotent_per_task(store: Store):
+    """FR6: 'exactly once'. A retry with a new report does not overwrite
+    the original; the existing report_id is returned.
+    """
+    article_id, version_id, task_id = _bootstrap_article_and_task(store)
+    r1 = FactCheckReport(
+        status=FactCheckStatus.CLEAN, claims=[], prompt_hash="h1", model="m1"
+    )
+    r2 = FactCheckReport(
+        status=FactCheckStatus.HAS_FINDINGS,
+        claims=[
+            FactCheckClaim(
+                text="X", verdict=ClaimVerdict.UNVERIFIED, sources=[], rationale=""
+            )
+        ],
+        prompt_hash="h2",
+        model="m2",
+    )
+    id1 = store.save_fact_check(task_id=task_id, final_version_id=version_id, report=r1)
+    id2 = store.save_fact_check(task_id=task_id, final_version_id=version_id, report=r2)
+    assert id1 == id2
+    got = store.get_fact_check(task_id)
+    # First report's content is preserved; the retry was a no-op.
+    assert got is not None
+    assert got.status is FactCheckStatus.CLEAN
+    assert got.model == "m1"
+
+
+def test_consume_already_consumed_note_raises(store: Store):
+    """Programming-error guard: passing the same note_id twice raises
+    inside the iteration tx and rolls everything back, instead of
+    silently no-op-ing."""
+    article_id, parent_id, task_id = _bootstrap_article_and_task(store)
+    note_id = store.add_human_note(task_id, "rephrase intro")
+
+    # First iteration consumes the note successfully.
+    store.record_iteration(
+        task_id=task_id,
+        article_id=article_id,
+        iter_index=0,
+        parent_version_id=parent_id,
+        decision=Decision.KEPT,
+        decision_reason="ok",
+        candidate_text="v",
+        edit_summary="",
+        editor_prompt_hash="",
+        editor_model="",
+        aggregate_score=4.0,
+        pref_delta=0.3,
+        pref_ci_low=0.1,
+        pref_ci_high=0.5,
+        reviewer_outputs=[_make_review("r1", 1.0, PairwisePref.CANDIDATE)],
+        consume_note_ids=[note_id],
+    )
+    assert store.pending_notes(task_id) == []
+
+    # A second iteration that tries to consume the same note must raise
+    # AND not write the iteration record.
+    with pytest.raises(ValueError, match="already consumed"):
         store.record_iteration(
             task_id=task_id,
             article_id=article_id,
@@ -545,7 +630,7 @@ def test_duplicate_idempotency_key_raises_and_rolls_back(store: Store):
             parent_version_id=parent_id,
             decision=Decision.KEPT,
             decision_reason="ok",
-            candidate_text="v1",
+            candidate_text="v2",
             edit_summary="",
             editor_prompt_hash="",
             editor_model="",
@@ -554,12 +639,11 @@ def test_duplicate_idempotency_key_raises_and_rolls_back(store: Store):
             pref_ci_low=0.1,
             pref_ci_high=0.5,
             reviewer_outputs=[_make_review("r1", 1.0, PairwisePref.CANDIDATE)],
-            idempotency_key="dup-key",
+            consume_note_ids=[note_id],
         )
-    # Still only the original iteration; no leak.
+    # Iter 1 must not exist; the rollback was clean.
     lineage = store.get_lineage(task_id)
-    assert len(lineage) == 1
-    assert lineage[0].iter_index == 0
+    assert [r.iter_index for r in lineage] == [0]
 
 
 def test_concurrent_writes_to_different_tasks_dont_interfere(tmp_path: Path):
