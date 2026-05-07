@@ -22,6 +22,7 @@ import hashlib
 from dataclasses import dataclass
 
 from ghostwriter.adapters.editor import EditorConfig, propose
+from ghostwriter.adapters.fact_checker import FactCheckerConfig, fact_check
 from ghostwriter.adapters.provider import Provider
 from ghostwriter.adapters.reviewer import (
     ReviewerConfig,
@@ -62,6 +63,7 @@ def _seed_for(task_id: str, iter_index: int) -> int:
 class OrchestratorConfig:
     editor: EditorConfig
     reviewers: dict[str, ReviewerConfig]
+    fact_checker: FactCheckerConfig | None = None
     n_bootstrap: int = 1000
     confidence: float = 0.90
 
@@ -140,6 +142,10 @@ class Orchestrator:
             raise ValueError(f"task {task_id} not found")
 
         if task["status"] in (TaskStatus.DONE.value, TaskStatus.ABORTED.value):
+            # Belt-and-suspenders: a task aborted externally before any
+            # iterate() ran has not yet had its FR6 fact-check. Run it now
+            # (idempotent at the Store layer); a second call here is a no-op.
+            await self._run_fact_check(task_id, task["article_id"])
             stop = task.get("stop_reason")
             return IterateResult(
                 iterations_run=0,
@@ -172,7 +178,7 @@ class Orchestrator:
         while True:
             # FR5 hard ceiling.
             if next_iter_index >= loop_limit:
-                return self._terminate(
+                return await self._terminate(
                     task_id=task_id,
                     article_id=article_id,
                     stop_reason=StopReason.LOOP_LIMIT,
@@ -191,6 +197,9 @@ class Orchestrator:
             # External abort (set via .abort() while we were iterating).
             cur_task = self.store.get_task(task_id)
             if cur_task["status"] == TaskStatus.ABORTED.value:
+                # External abort already wrote DONE/ABORTED state; we still
+                # want to run the FR6 fact-check on the final version.
+                await self._run_fact_check(task_id, article_id)
                 return IterateResult(
                     iterations_run=iterations_run,
                     stop_reason=StopReason.ABORTED,
@@ -213,7 +222,7 @@ class Orchestrator:
             if decision is Decision.KEPT and aggregate >= target and all(
                 a >= floor for a in per_reviewer_aggregates
             ):
-                return self._terminate(
+                return await self._terminate(
                     task_id=task_id,
                     article_id=article_id,
                     stop_reason=StopReason.TARGET_REACHED,
@@ -221,7 +230,7 @@ class Orchestrator:
                     final_aggregate=aggregate,
                 )
 
-    def _terminate(
+    async def _terminate(
         self,
         *,
         task_id: str,
@@ -237,10 +246,34 @@ class Orchestrator:
             stop_reason=stop_reason,
             final_version_id=final_v["id"] if final_v else None,
         )
+        # FR6 advisory fact-check; idempotent per task_id at the Store layer
+        # so a retried iterate() that lands here twice writes once.
+        await self._run_fact_check(task_id, article_id)
         return IterateResult(
             iterations_run=iterations_run,
             stop_reason=stop_reason,
             final_aggregate=final_aggregate,
+        )
+
+    async def _run_fact_check(self, task_id: str, article_id: str) -> None:
+        """FR6 end-of-loop fact-check. Advisory only — never blocks the
+        return value or affects the lineage. Skipped silently if
+        config.fact_checker is None (test convenience)."""
+        if self.config.fact_checker is None:
+            return
+        if self.store.get_fact_check(task_id) is not None:
+            return
+        final_v = self.store.latest_version(article_id)
+        if final_v is None:
+            return
+        article_text = self.store.read_version_text(final_v["id"])
+        report = await fact_check(
+            config=self.config.fact_checker,
+            article_text=article_text,
+            provider=self.provider,
+        )
+        self.store.save_fact_check(
+            task_id=task_id, final_version_id=final_v["id"], report=report
         )
 
     async def _run_one(
