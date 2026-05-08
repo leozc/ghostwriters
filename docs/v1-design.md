@@ -292,27 +292,34 @@ Bootstrap CI: resample reviewers with replacement N=1000 times, recompute weight
 ## Provider abstraction
 
 ```python
-class LLMProvider(Protocol):
-    async def call(self, prompt: str, model: str, **kwargs) -> ProviderResponse: ...
+class Provider(Protocol):
+    async def complete(
+        self, *, model: str, system: str, user: str, max_tokens: int = 2048
+    ) -> str: ...
 ```
 
-Concrete implementations: `AnthropicProvider`, `OpenAIProvider`. Configured per adapter:
+Single concrete impl: `LiteLLMProvider`, wrapping `litellm.acompletion`. LiteLLM normalizes the request format across vendors, so adapters never see vendor-specific types. Auth is environment-based (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`).
 
-```toml
-[editor]
-provider = "anthropic"
-model = "claude-opus-4-7"
+Vendor + model selection is a string per adapter, using LiteLLM's `<vendor>/<model>` convention:
 
-[reviewer]
-provider = "anthropic"
-model = "claude-sonnet-4-6"
-
-[fact_checker]
-provider = "openai"
-model = "gpt-5"
+```python
+EditorConfig(model="anthropic/claude-opus-4-7")
+ReviewerConfig(rubric_model="anthropic/claude-haiku-4-5",
+               pairwise_model="anthropic/claude-sonnet-4-6")
+FactCheckerConfig(model="openai/gpt-5")
 ```
 
-Editor and fact-checker SHOULD use different providers/models (best practice for v1; not enforced in code).
+Vendor-specific knobs (Anthropic prompt caching, adaptive thinking; OpenAI `reasoning_effort`; Gemini `thinking_config`) are passed via `LiteLLMProvider(extra_params=...)`. Operators may construct one provider per tier when knobs differ:
+
+```python
+editor_provider = LiteLLMProvider(
+    extra_params={"cache_control": {"type": "ephemeral"},
+                  "thinking": {"type": "adaptive"}})
+reviewer_provider = LiteLLMProvider()  # Haiku doesn't support adaptive thinking
+factcheck_provider = LiteLLMProvider(extra_params={"reasoning_effort": "high"})
+```
+
+Editor and fact-checker SHOULD use different vendors/models (best practice for v1; not enforced in code).
 
 ## Project layout
 
@@ -329,7 +336,8 @@ ghostwriter/
     editor.py
     reviewer.py
     fact_checker.py
-    provider.py         LLMProvider protocol + concrete impls
+    provider.py         Provider protocol + FakeProvider
+    litellm_provider.py LiteLLMProvider (production)
   store/
     sqlite.py           connection, migrations
     queries.py          typed accessors per table

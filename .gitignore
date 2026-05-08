@@ -8,3 +8,5 @@ __pycache__/
 .git_backup/
 *.pyc
 .DS_Store
+.gstack/
+private/

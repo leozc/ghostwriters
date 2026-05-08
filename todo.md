@@ -12,30 +12,32 @@ production-readiness or future-version scope.
 These need to happen once before the system handles a real article. None
 are code; they're operational.
 
-- [ ] **End-to-end smoke test against the real Anthropic API.** Requires an
-      API key, a sample article, and a real reviewer panel. Not
-      automatable in CI. Construct an `AnthropicProvider`, run
+- [ ] **End-to-end smoke test against a real LLM API.** Requires an API
+      key for at least one vendor, a sample article, and a real reviewer
+      panel. Not automatable in CI. Construct a `LiteLLMProvider`, run
       `Orchestrator.iterate(task_id)` against a 1-iteration task, verify
       lineage + fact-check report look sane. Watch token usage.
       Estimated: 30 min.
 
-- [ ] **Pick concrete model defaults per adapter.** The adapter configs
-      (`EditorConfig.model`, `ReviewerConfig.rubric_model` /
-      `pairwise_model`, `FactCheckerConfig.model`) currently take any
-      string. Recommended starting points based on task shape:
-      - Editor: `claude-sonnet-4-6` (balance of intelligence + cost)
-      - Reviewer rubric: `claude-haiku-4-5` (fast, cheap, plenty smart for
-        scoring)
-      - Reviewer pairwise: `claude-sonnet-4-6` (more nuanced judgment)
-      - Fact-checker: `claude-sonnet-4-6` (precision matters)
-      Validate with the smoke test above; adjust based on quality vs cost.
+- [ ] **Pick concrete model strings per adapter.** Models are routed via
+      LiteLLM's `<vendor>/<model>` convention. Recommended starting
+      points (any vendor, mixable):
+      - Editor: `anthropic/claude-sonnet-4-6` or `openai/gpt-5`
+      - Reviewer rubric: `anthropic/claude-haiku-4-5` (fast, cheap)
+      - Reviewer pairwise: `anthropic/claude-sonnet-4-6` (nuanced judgment)
+      - Fact-checker: `openai/gpt-5` w/ `reasoning_effort=high`, or
+        `anthropic/claude-sonnet-4-6` (precision matters)
+      Validate with the smoke test; adjust based on quality vs cost.
 
-- [ ] **Decide on `extra_params` for the production `AnthropicProvider`.**
-      For Claude 4.x the recommended setup is
-      `{"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}`.
-      For Haiku 4.5 in the reviewer slots, leave `extra_params={}`
-      (Haiku doesn't support adaptive thinking). Two providers, one per
-      tier, is fine.
+- [ ] **Decide on `extra_params` per tier.** Each `LiteLLMProvider` takes
+      vendor-specific knobs:
+      - Anthropic Opus 4.7: `{"thinking": {"type": "adaptive"},
+        "cache_control": {"type": "ephemeral"}}`
+      - Anthropic Haiku 4.5: `{"cache_control": {"type": "ephemeral"}}`
+        (Haiku doesn't support adaptive thinking)
+      - OpenAI gpt-5 / o3: `{"reasoning_effort": "high"}`
+      - Gemini 2.5 Pro: `{"thinking_config": {"thinking_budget": 1024}}`
+      One provider per tier is fine — they're cheap to construct.
 
 ---
 
@@ -60,14 +62,15 @@ are code; they're operational.
       gated behind `pytest -m integration` so CI skips it by default.
       Operators run before each production deploy.
 
-- [ ] **Prompt caching tuning.** The `AnthropicProvider` already enables
-      auto-caching, but our system prompts are below the 1K-4K minimum on
-      most models so they probably won't cache as-is. The win would come
+- [ ] **Prompt caching tuning.** Anthropic auto-caches when
+      `extra_params={"cache_control": {"type": "ephemeral"}}` is set, but
+      our system prompts are below the 1K-4K minimum on most models so
+      they may not cross the cache threshold as-is. The win would come
       from restructuring the user prompt so the stable prefix
-      (article + guardrails) precedes the volatile suffix (reviewer id),
-      crossing the threshold. Measure first via
-      `usage.cache_read_input_tokens` after the smoke test; tune only if
-      cache hit rate is low and cost matters.
+      (article + guardrails) precedes the volatile suffix (reviewer id).
+      Measure first via LiteLLM's `usage.cache_read_input_tokens` after
+      the smoke test; tune only if cache hit rate is low and cost matters.
+      OpenAI/Gemini cache automatically server-side — no opt-in needed.
 
 ---
 
