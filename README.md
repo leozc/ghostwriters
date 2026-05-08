@@ -1,177 +1,103 @@
 # ghostwriter
 
-**[autoresearch](https://github.com/karpathy/autoresearch), but for writing.**
+Single-tenant service for autonomous prose optimization. Inspired by [Karpathy's autoresearch](https://github.com/karpathy/autoresearch): an iterative loop of *propose → review → keep-or-revert*, with a factual gate, lineage tracking, and pairwise-preference promotion.
 
-Karpathy's autoresearch showed that an autonomous loop of "try, evaluate, keep or discard" can optimize research code without human intervention. Ghostwriter applies the same idea to prose.
+## What v1 does
 
-You write the first draft. Ghostwriter assembles a **panel of AI agents** -- each one a different expert persona (investor, engineer, VP, end user) -- and has them score your draft independently, in parallel. A separate set of **reader agents** (simulating Hacker News commenters and X/Twitter reactions) poke holes from the outside. The standalone evaluator prefers Anthropic and falls back to OpenAI through your local Codex login when `ANTHROPIC_API_KEY` is unavailable.
+You hand ghostwriter an article and a panel of reviewer personas with weights. The orchestrator iterates:
 
-Then a **writer agent** reads all the scores and comments, diagnoses the weakest point, and makes one surgical edit. The loop commits, re-evaluates, and keeps the edit only if the weakest score improved. If not, it reverts. **Your draft never gets worse. It only gets sharper.**
+1. **Editor** drafts a candidate based on the prior version, reviewer feedback, and any human notes injected mid-loop.
+2. **Reviewers** score the candidate (rubric + pairwise preference vs. the incumbent), in parallel.
+3. **Promotion gate** keeps the candidate iff the bootstrap-CI lower bound on the weighted preference is above zero (FR4) — score-gaming is harder when promotion requires near-unanimous human-preference signal, not just rubric points.
+4. **Fact-checker** runs once at the terminal step (FR6), advisory.
+5. **Lineage store** records every iteration, including rejected candidates, with the prompt hashes used.
 
-The result: a blog post that has been stress-tested against multiple expert perspectives, tightened by a style-aware editor, and validated by readers from two competing AI models -- all while you were getting coffee.
+You can run multiple tasks per article concurrently with different reviewer panels and goals.
 
----
+## Architecture
 
-## Get started in 3 steps
+```
++---------+     +-----------------+     +------------+
+|   API   | <-> |  Orchestrator   | <-> |  Adapters  |
+| (HTTP)  |     |  - per-task lock |     |  Editor    |
++---------+     |  - parallel rev  |     |  Reviewer  |
+                |  - pairwise gate |     |  FactCheck |
+                +-----------------+     +-----+------+
+                          |                   |
+                          v                   v
+                   +-----------+        +-----------+
+                   |  Lineage  |        | Provider  |
+                   |  Store    |        | (LiteLLM) |
+                   |  SQLite   |        +-----------+
+                   +-----------+              |
+                                              v
+                              Anthropic / OpenAI / Gemini / 100+
+```
 
-### 1. Bring your draft and set the article goal
+- **One Provider impl** — `LiteLLMProvider` wraps [LiteLLM](https://github.com/BerriAI/litellm). Models are addressed as `<vendor>/<model>` (`anthropic/claude-opus-4-7`, `openai/gpt-5`, `gemini/gemini-2.5-pro`). Vendor-specific knobs (Anthropic prompt caching, adaptive thinking; OpenAI `reasoning_effort`; Gemini `thinking_config`) go through `extra_params`.
+- **Pluggable adapters** — `EditorConfig` / `ReviewerConfig` / `FactCheckerConfig` accept any model string; mix vendors per role freely.
+- **SQLite-backed lineage** — immutable iteration records, content blobs on disk, per-task asyncio lock.
+
+See `docs/v1-design.md` for the full architecture and `docs/v1-requirements.md` for the FR/A traceability matrix.
+
+## Quick start
 
 ```bash
 git clone https://github.com/leozc/ghostwriters
-cd ghostwriters && uv sync
+cd ghostwriters
+uv sync
 ```
 
-Drop your blog post draft into the repo (e.g. `myblog.md`), then edit **`goal.md`** to tell ghostwriter what the article should accomplish: the thesis, the tone, what must be included, what to avoid.
-
-`goal.md` is the north star. The writer agent and every evaluator reads it.
-
-### 2. (Optional) Tune the personas and voice
-
-The repo ships with ready-to-use example personas. Customize if you want:
-
-| File | What it controls |
-|---|---|
-| `personas/*.md` | Your evaluation panel. Who reads and scores the draft. Copy `_template.md` to create new ones. |
-| `config.toml` | Focus points: distribute 100 points across personas. Higher = writer prioritizes that reader. |
-| `writer_config.md` | Author voice and tone (CEO vs CTO, visionary vs practical, formal vs conversational). |
-| `writer.md` | Writing style rules: anti-AI-slop patterns, editing approach, what good prose sounds like. |
-
-### 3. Choose your evaluator
-
-The default config prefers Anthropic, but falls back to Codex/OpenAI when no `ANTHROPIC_API_KEY` is present:
-
-```toml
-[eval]
-provider = "anthropic"
-model = "claude-opus-4-6"
-openai_model = "gpt-5.4"
-```
-
-If you want the Anthropic path, export `ANTHROPIC_API_KEY`.
-
-If you do not set `ANTHROPIC_API_KEY`, Ghostwriter will use Codex/OpenAI instead. Check that Codex is authenticated:
+Set the API keys for whatever vendors you'll route to:
 
 ```bash
-codex login status
+export ANTHROPIC_API_KEY=...   # for anthropic/* models
+export OPENAI_API_KEY=...      # for openai/* models
+export GEMINI_API_KEY=...      # for gemini/* models
 ```
 
-If needed, run `codex login`. You can also force Codex/OpenAI explicitly by setting `provider = "openai"` or `provider = "codex"`.
-
-### 4. Run the loop in your agent
+Run the HTTP API:
 
 ```bash
-make init DRAFT=myblog.md
+uv run uvicorn ghostwriter.api:app --reload
 ```
 
-Then open your agent environment and prompt it with [program.md](./program.md). In Claude Code, for example:
+Or wire the orchestrator directly in Python — see `test_acceptance.py` for an end-to-end example using `FakeProvider`.
 
-```
-Read program.md and start the autoresearch loop from @myblog.md
-```
+## Configuring a provider
 
-That's it. Walk away. Come back to a better draft.
+```python
+from ghostwriter.adapters.litellm_provider import LiteLLMProvider
+from ghostwriter.adapters.editor import EditorConfig
+from ghostwriter.adapters.reviewer import ReviewerConfig
+from ghostwriter.adapters.fact_checker import FactCheckerConfig
 
----
+# One provider per tier — each tier picks its own knobs.
+editor_provider = LiteLLMProvider(
+    extra_params={"cache_control": {"type": "ephemeral"},
+                  "thinking": {"type": "adaptive"}}
+)
+reviewer_provider = LiteLLMProvider(
+    extra_params={"cache_control": {"type": "ephemeral"}}  # Haiku: no thinking
+)
+factcheck_provider = LiteLLMProvider(
+    extra_params={"reasoning_effort": "high"}  # OpenAI gpt-5 / o3
+)
 
-## How the multi-agent loop works
-
-Each iteration spawns **8+ agents in parallel**:
-
-```
-  You write the draft + goal.md
-          |
-    Writer Agent              1 agent: makes one surgical edit
-          |
-     git commit
-          |
-    +-----+-----+-----+-----+-----+-----+-----+-----+
-    |     |     |     |     |     |     |     |     |
-   Inv  VP Eng Sr Dev Engr  Claude Claude Codex Codex    8 agents, parallel
-   eval  eval  eval  eval   (HN)   (X)   (HN)   (X)
-    |     |     |     |     |     |     |     |     |
-    +-----+-----+-----+-----+-----+-----+-----+-----+
-          |
-    Keep or Discard       Weakest score improved? Keep. Otherwise git revert.
-          |
-      Loop forever
+editor_cfg    = EditorConfig(model="anthropic/claude-sonnet-4-6")
+reviewer_cfg  = ReviewerConfig(rubric_model="anthropic/claude-haiku-4-5",
+                               pairwise_model="anthropic/claude-sonnet-4-6")
+factcheck_cfg = FactCheckerConfig(model="openai/gpt-5")
 ```
 
-**4 expert evaluators** -- each persona reads the draft independently 3 times (for noise reduction via median) and scores it on 4-6 rubric dimensions. An investor looks for thesis clarity and founder signal. An engineer looks for technical substance and builder energy. A VP looks for cost reality and strategic credibility. They don't agree with each other, and that's the point.
-
-**4 reader critics** -- Claude and Codex (GPT) can simulate a Hacker News commenter and an X/Twitter reactor. Two models, two platforms, four distinct voices. Codex tends to be harsher. When both models flag the same weakness, it's real. When only one does, the writer weighs it but doesn't over-rotate.
-
-**1 writer agent** -- reads all scores, all comments, the focus point weights, and the voice config. Diagnoses the single highest-impact weakness and makes one focused edit. Not a text inserter: a professional editor that can restructure, merge, split, cut, or rewrite.
-
-**The ratchet** -- every edit is evaluated. If the weakest score doesn't improve by >= 0.5, the commit is reverted. The draft monotonically improves, like autoresearch's val_bpb. Bad edits are never kept.
-
-**Focus points** -- you distribute 100 points across personas in `config.toml`. A persona at 40 points matters 4x more than one at 10. The writer fixes the highest-weighted weakness first.
-
-**Human-in-the-loop** -- you can interrupt anytime to inject domain knowledge, facts, or direction. The writer agent incorporates your input in the configured voice and the loop continues. The biggest wins in practice come from these human interrupts, not autonomous iterations.
-
----
-
-## Prerequisites
-
-- [uv](https://docs.astral.sh/uv/) -- Python package manager
-- [OpenAI Codex CLI](https://github.com/openai/codex) -- fallback evaluator path and reader path
-- `codex login status` should report a working login if you want the OpenAI/Codex path
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) -- optional, if you want to run the autonomous loop there
-- `ANTHROPIC_API_KEY` -- optional, used when the preferred Anthropic evaluator path is available
-
----
-
-## Customizing for your domain
-
-The example personas target a developer tools audience. To adapt ghostwriter for any domain:
-
-1. **Define your readers** -- copy `personas/_template.md` and fill in identity, rubric (4-6 scored dimensions), and dealbreaker.
-2. **Set the article goal** -- edit `goal.md` with your thesis, tone, must-include/must-avoid lists.
-3. **Configure the voice** -- edit `writer_config.md` for author role, tone spectrum, sentence style.
-4. **Allocate focus** -- distribute 100 points in `config.toml` across your personas.
-
----
-
-## Project structure
-
-```
-ghostwriter/
-|-- program.md            Orchestrator instructions (the "brain")
-|-- writer.md             Writing style: anti-AI-slop rules, editing approach
-|-- writer_config.md      Author voice: tone spectrum, vocabulary, sentence style
-|-- goal.md               Article goal: what the post should accomplish
-|-- config.toml           Focus points, eval thresholds, stopping criteria
-|-- evaluate.md           Evaluation protocol (fixed)
-|-- personas/             One file per reader persona
-|-- data.py               Iteration data management CLI
-|-- evaluate.py           Standalone evaluation harness
-|-- score.py              Scoring math (medians, aggregates)
-|-- score_history.py      Dimension score evolution across iterations
-|-- test_data.py          Unit tests (19 tests)
-+-- Makefile              Convenience commands
-```
-
-**Runtime artifacts** (gitignored, created by `make init`):
-
-```
-data/
-|-- draft.md              Working draft (writer edits this)
-|-- manifest.json         Iteration index
-+-- iter_NN/              Per-iteration snapshots, scores, comments
-```
-
----
-
-## Makefile commands
+## Tests
 
 ```bash
-make init DRAFT=my_post.md        # Bootstrap data/ from your draft
-make test                          # Run unit tests
-make status                        # Show iteration history
-make history                       # Show dimension score evolution across iterations
-make clean                         # Wipe data/ for a fresh run
+uv run pytest -q          # unit + integration + acceptance
+uv run pytest test_acceptance.py -v   # A1–A6 user-facing scenarios
 ```
 
----
+Real-API behavior is not exercised in the test suite. See `todo.md` for the recommended pre-deploy smoke test.
 
 ## License
 
